@@ -1,0 +1,2649 @@
+//! Exercises the `fstool` binary end to end via its CLI.
+//!
+//! Whole file is Unix-only: the fixtures construct POSIX-permission /
+//! symlink trees and shell out to Linux-only tools (`mke2fs`, `e2fsck`,
+//! `debugfs`, `truncate`, etc.) for cross-validation.
+
+#![cfg(all(
+    unix,
+    feature = "cli",
+    any(
+        feature = "tar",
+        feature = "ext",
+        feature = "fat",
+        feature = "hfs",
+        feature = "exfat",
+        feature = "ntfs",
+        feature = "xfs",
+        feature = "hfs-plus",
+        feature = "apfs"
+    )
+))]
+
+use std::process::Command;
+
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
+use tempfile::NamedTempFile;
+
+/// Path to the freshly-built `fstool` binary (provided by Cargo for
+/// integration tests).
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
+const FSTOOL: &str = env!("CARGO_BIN_EXE_fstool");
+
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "hfs",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
+fn which(tool: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {tool}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// build (bare ext4 spec) → ls → cat → add → cat the added file.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_build_ls_cat_add_roundtrip() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Source tree + a spare-capacity spec (extra inodes via a bigger tree
+    // is awkward; instead we test `add` against the headroom a fresh image
+    // happens to have).
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("one.txt"), b"first\n").unwrap();
+
+    let spec = NamedTempFile::new().unwrap();
+    std::fs::write(
+        spec.path(),
+        format!(
+            "[filesystem]\ntype = \"ext4\"\nsource = \"{}\"\nblock_size = 1024\n",
+            srcdir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+
+    // build
+    let out = Command::new(FSTOOL)
+        .arg("build")
+        .arg(spec.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ls /
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        listing.contains("one.txt"),
+        "ls missing one.txt:\n{listing}"
+    );
+
+    // cat /one.txt
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/one.txt")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"first\n");
+
+    // add a host file
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"added via cli\n").unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("add")
+        .arg(img.path())
+        .arg(extra.path())
+        .arg("/two.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // e2fsck must still be clean after the modification.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after add:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // cat the added file
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/two.txt")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"added via cli\n");
+}
+
+/// build → rm a file → rm an empty dir → e2fsck clean → non-empty dir
+/// rejected.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_rm_file_and_empty_dir() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Source tree: a file, an empty dir, and a non-empty dir.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("doomed.txt"), b"bye\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("emptydir")).unwrap();
+    std::fs::create_dir(srcdir.path().join("fulldir")).unwrap();
+    std::fs::write(srcdir.path().join("fulldir/keep"), b"k\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // rm a regular file.
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/doomed.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rm file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // rm an empty directory.
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/emptydir")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rm empty dir failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // rm a non-empty directory must fail.
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/fulldir")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "rm non-empty dir should have failed");
+
+    // e2fsck clean after the removals.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after rm:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // The removed entries are gone; the kept ones remain.
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(!listing.contains("doomed.txt"), "doomed.txt still present");
+    assert!(!listing.contains("emptydir"), "emptydir still present");
+    assert!(listing.contains("fulldir"), "fulldir wrongly removed");
+}
+
+/// `fstool info` reports the expected filesystem summary.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_info_reports_ext4() {
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("x"), b"y\n").unwrap();
+    let img = NamedTempFile::new().unwrap();
+
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let info = String::from_utf8_lossy(&out.stdout);
+    assert!(info.contains("ext4"), "info missing kind:\n{info}");
+    assert!(
+        info.contains("block size"),
+        "info missing block size:\n{info}"
+    );
+}
+
+/// `fstool info disk.img` on a partitioned image prints the table;
+/// `fstool info disk.img:N` and `ls`/`cat` walk into a partition's FS.
+#[cfg(all(feature = "ext", feature = "fat"))]
+#[test]
+fn cli_partition_target_syntax() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Build a GPT disk with an EFI/FAT32 + a root/ext4.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"in a partition\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("etc")).unwrap();
+    std::fs::write(srcdir.path().join("etc/app.conf"), b"mode=on\n").unwrap();
+
+    let spec = NamedTempFile::new().unwrap();
+    std::fs::write(
+        spec.path(),
+        format!(
+            r#"
+            [image]
+            size = "128MiB"
+            partition_table = "gpt"
+
+            [[partitions]]
+            name = "EFI"
+            type = "esp"
+            size = "48MiB"
+
+            [partitions.filesystem]
+            type = "fat32"
+            volume_label = "EFI"
+
+            [[partitions]]
+            name = "root"
+            type = "linux"
+            size = "remaining"
+
+            [partitions.filesystem]
+            type = "ext4"
+            source = "{}"
+            block_size = 1024
+            "#,
+            srcdir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("build")
+        .arg(spec.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `info disk.img` (no :N) prints the partition table.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("partition table:"), "missing table header:\n{s}");
+    assert!(s.contains("gpt"), "expected gpt label:\n{s}");
+    assert!(s.contains("EFI"), "expected EFI name:\n{s}");
+    assert!(s.contains("root"), "expected root name:\n{s}");
+
+    // `info :1` opens the EFI FAT32 partition.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(format!("{}:1", img.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "info :1 failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("fat32"), "expected fat32 fs:\n{s}");
+
+    // `info :2` opens the root ext4 partition.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(format!("{}:2", img.path().display()))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("ext4"), "expected ext4 fs:\n{s}");
+
+    // `ls :2 /` shows the source tree.
+    let out = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(format!("{}:2", img.path().display()))
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("hello"));
+    assert!(s.contains("etc"));
+
+    // `cat :2 /etc/app.conf` returns the file body.
+    let out = Command::new(FSTOOL)
+        .arg("cat")
+        .arg(format!("{}:2", img.path().display()))
+        .arg("/etc/app.conf")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"mode=on\n");
+
+    // Out-of-range partition index → clean error.
+    let out = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(format!("{}:9", img.path().display()))
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let s = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        s.contains("out of range"),
+        "expected out-of-range error:\n{s}"
+    );
+
+    // `add :2 host /new.txt` writes into a partition; e2fsck still clean.
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"added to root partition\n").unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("add")
+        .arg(format!("{}:2", img.path().display()))
+        .arg(extra.path())
+        .arg("/new.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add :2 failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // dd out the root partition so e2fsck can check it.
+    // sgdisk -p tells us the LBAs.
+    if which("sgdisk") {
+        let p = Command::new("sgdisk")
+            .arg("-p")
+            .arg(img.path())
+            .output()
+            .unwrap();
+        let pout = String::from_utf8_lossy(&p.stdout);
+        let root_line = pout
+            .lines()
+            .find(|l| l.trim_start().starts_with("2 "))
+            .expect("partition 2 line");
+        let nums: Vec<u64> = root_line
+            .split_whitespace()
+            .skip(1)
+            .take(2)
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let (start, end) = (nums[0], nums[1]);
+        let part = NamedTempFile::new().unwrap();
+        let dd = Command::new("dd")
+            .arg(format!("if={}", img.path().display()))
+            .arg(format!("of={}", part.path().display()))
+            .arg("bs=512")
+            .arg(format!("skip={start}"))
+            .arg(format!("count={}", end - start + 1))
+            .arg("status=none")
+            .output()
+            .unwrap();
+        assert!(dd.status.success());
+        let fsck = Command::new("e2fsck")
+            .arg("-fn")
+            .arg(part.path())
+            .output()
+            .unwrap();
+        assert!(
+            fsck.status.success(),
+            "e2fsck on root partition failed after :2 add:\n{}",
+            String::from_utf8_lossy(&fsck.stdout)
+        );
+    }
+}
+
+/// `fstool shell` runs an SFTP-style REPL. Drive it with a scripted
+/// stdin and assert the captured stdout contains the right output for
+/// each command.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_shell_navigates_and_mutates() {
+    if !which("e2fsck") {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    }
+
+    // Build a small ext4 with a file and a subdirectory.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(srcdir.path().join("docs")).unwrap();
+    std::fs::write(srcdir.path().join("docs/readme"), b"deep body\n").unwrap();
+    std::fs::write(srcdir.path().join("top.txt"), b"top body\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed");
+
+    // Drive the shell.
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"shell-added\n").unwrap();
+    let script = format!(
+        "pwd\n\
+         ls /\n\
+         cd docs\n\
+         pwd\n\
+         cat readme\n\
+         cd ..\n\
+         mkdir /new\n\
+         put {} /new/copy.txt\n\
+         cat /new/copy.txt\n\
+         rm /top.txt\n\
+         ls /\n\
+         quit\n",
+        extra.path().display()
+    );
+
+    let mut child = std::process::Command::new(FSTOOL)
+        .arg("shell")
+        .arg(img.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "shell exited non-zero:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    assert!(
+        stdout.contains("top.txt"),
+        "missing top.txt in /:\n{stdout}"
+    );
+    assert!(stdout.contains("docs/"), "missing docs/ in /:\n{stdout}");
+    assert!(stdout.contains("/docs"), "pwd after cd docs:\n{stdout}");
+    assert!(stdout.contains("deep body"), "cat readme output:\n{stdout}");
+    assert!(
+        stdout.contains("shell-added"),
+        "cat of added file:\n{stdout}"
+    );
+    // After `rm /top.txt`, the listing must no longer show it. The
+    // assertion below counts occurrences — the script does `ls /` twice,
+    // so before-rm it appears once; after-rm it shouldn't appear in the
+    // second listing. We just check the FINAL state via a fresh `ls`.
+    let final_listing = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&final_listing.stdout);
+    assert!(!s.contains("top.txt"), "top.txt should be gone:\n{s}");
+    assert!(s.contains("new"), "/new should exist:\n{s}");
+
+    // e2fsck still clean after all the shell mutations.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after shell mutations:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+}
+
+/// FAT32 add/rm through `fstool`: parallel to the ext test.
+#[cfg(feature = "fat")]
+#[test]
+fn cli_fat32_add_and_rm() {
+    if !which("fsck.vfat") {
+        eprintln!("skipping: fsck.vfat not installed");
+        return;
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("keep.txt"), b"keep\n").unwrap();
+    std::fs::write(srcdir.path().join("goodbye.txt"), b"bye\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args([
+            "create", "-t", "fat32", "--size", "64MiB", "--label", "CLIRM",
+        ])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // add a host file
+    let extra = NamedTempFile::new().unwrap();
+    std::fs::write(extra.path(), b"added via cli\n").unwrap();
+    let out = Command::new(FSTOOL)
+        .arg("add")
+        .arg(img.path())
+        .arg(extra.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // cat the added file
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"added via cli\n");
+
+    // rm a different file
+    let out = Command::new(FSTOOL)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/goodbye.txt")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rm failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // fsck must still be clean.
+    let res = Command::new("fsck.vfat")
+        .args(["-n", "-v"])
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "fsck.vfat failed after add/rm:\n{}",
+        String::from_utf8_lossy(&res.stdout)
+    );
+
+    // ls shows the expected state.
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(listing.contains("keep.txt"));
+    assert!(listing.contains("added.txt"));
+    assert!(!listing.contains("goodbye.txt"));
+}
+
+/// `fstool create -t fat32` → `ls` → `cat` → `info` on a FAT32 image. Exercises
+/// the unified inspection dispatch (the CLI doesn't know it's FAT32).
+#[cfg(feature = "fat")]
+#[test]
+fn cli_fat32_build_ls_cat_info_roundtrip() {
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("short.txt"), b"short body\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("nest")).unwrap();
+    std::fs::write(
+        srcdir.path().join("nest/A Long Name.md"),
+        b"long-name body\n",
+    )
+    .unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args([
+            "create", "-t", "fat32", "--size", "64MiB", "--label", "CLIFAT",
+        ])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // info names the FS as fat32.
+    let out = Command::new(FSTOOL)
+        .arg("info")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let info = String::from_utf8_lossy(&out.stdout);
+    assert!(info.contains("fat32"), "info missing fat32:\n{info}");
+    assert!(info.contains("CLIFAT"), "info missing label:\n{info}");
+
+    // ls /
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(listing.contains("short.txt"));
+    assert!(listing.contains("nest"));
+
+    // ls a subdirectory.
+    let out = Command::new(FSTOOL)
+        .args(["ls"])
+        .arg(img.path())
+        .arg("/nest")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let nest = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        nest.contains("A Long Name.md"),
+        "long-name entry missing from /nest:\n{nest}"
+    );
+
+    // cat the deep long-named file.
+    let out = Command::new(FSTOOL)
+        .args(["cat"])
+        .arg(img.path())
+        .arg("/nest/A Long Name.md")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cat failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"long-name body\n");
+}
+
+/// `fstool convert` does a byte-for-byte raw ↔ qcow2 round-trip.
+#[cfg(all(feature = "ext", feature = "qcow2"))]
+#[cfg(feature = "ext")]
+#[test]
+fn cli_convert_and_repack_refuse_same_file() {
+    // `convert a a` / `repack a a` used to open the source, then create
+    // (truncate) the destination — zeroing the image under the reader.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"same file\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("disk.img");
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed");
+    let before = std::fs::read(&img).unwrap();
+    assert!(before.iter().any(|&b| b != 0));
+
+    for cmd in ["convert", "repack"] {
+        let r = Command::new(FSTOOL)
+            .arg(cmd)
+            .arg(&img)
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(!r.status.success(), "{cmd} onto itself must fail");
+        let err = String::from_utf8_lossy(&r.stderr);
+        assert!(err.contains("same file"), "{cmd}: unexpected stderr: {err}");
+        assert_eq!(
+            std::fs::read(&img).unwrap(),
+            before,
+            "{cmd} clobbered the image"
+        );
+    }
+    // Same guard when the source carries a partition selector.
+    let mut spec = img.as_os_str().to_owned();
+    spec.push(":1");
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(&spec)
+        .arg(&img)
+        .output()
+        .unwrap();
+    assert!(!r.status.success());
+    assert_eq!(std::fs::read(&img).unwrap(), before);
+}
+
+#[test]
+fn cli_convert_raw_qcow2_roundtrip() {
+    if !which("qemu-img") {
+        eprintln!("skipping: qemu-img not installed");
+        return;
+    }
+
+    // Build a small ext4 raw image to use as the convert source.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"hello convert\n").unwrap();
+    let raw = NamedTempFile::new().unwrap();
+    let out = Command::new(FSTOOL)
+        .args(["create", "-t", "ext4"])
+        .arg(srcdir.path())
+        .arg("-o")
+        .arg(raw.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let qcow = dir.path().join("disk.qcow2");
+    let raw2 = dir.path().join("disk2.img");
+
+    // raw → qcow2
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(raw.path())
+        .arg(&qcow)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "convert raw→qcow2 failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // qemu-img check on the qcow2.
+    let chk = Command::new("qemu-img")
+        .arg("check")
+        .arg(&qcow)
+        .output()
+        .unwrap();
+    assert!(chk.status.success(), "qemu-img check failed");
+
+    // qcow2 → raw, must match original byte-for-byte.
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(&qcow)
+        .arg(&raw2)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "convert qcow2→raw failed");
+    let a = std::fs::read(raw.path()).unwrap();
+    let b = std::fs::read(&raw2).unwrap();
+    assert_eq!(a, b, "round-tripped raw differs from original");
+
+    // Grow: 64 MiB destination, source still readable through the larger image.
+    let big = dir.path().join("big.qcow2");
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(raw.path())
+        .arg(&big)
+        .args(["--size", "64MiB"])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "convert --size grow failed");
+    let ls = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(&big)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let s = String::from_utf8_lossy(&ls.stdout);
+    assert!(s.contains("hello"), "grown image lost source content:\n{s}");
+
+    // Shrink request is rejected.
+    let small = dir.path().join("small.qcow2");
+    let r = Command::new(FSTOOL)
+        .arg("convert")
+        .arg(raw.path())
+        .arg(&small)
+        .args(["--size", "1KiB"])
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "shrink should have been rejected");
+    let s = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        s.contains("repack"),
+        "rejection should point to repack:\n{s}"
+    );
+}
+
+/// `fstool repack --shrink` produces a smaller image whose content
+/// matches the source.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_repack_shrink() {
+    if !which("e2fsck") || !which("mke2fs") {
+        eprintln!("skipping: e2fsck/mke2fs missing");
+        return;
+    }
+
+    // Make a deliberately oversized ext4 image via mke2fs.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("keep.txt"), b"keep this\n").unwrap();
+    std::fs::create_dir(srcdir.path().join("etc")).unwrap();
+    std::fs::write(srcdir.path().join("etc/conf"), b"v=1\n").unwrap();
+
+    let big = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(big.path())
+        .output()
+        .unwrap();
+    let mk = Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg("-L")
+        .arg("src")
+        .arg(big.path())
+        .output()
+        .unwrap();
+    assert!(
+        mk.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&mk.stderr)
+    );
+    let big_len = std::fs::metadata(big.path()).unwrap().len();
+
+    // Repack with --shrink.
+    let shrunk = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(big.path())
+        .arg(shrunk.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack --shrink failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let shrunk_len = std::fs::metadata(shrunk.path()).unwrap().len();
+    assert!(
+        shrunk_len < big_len,
+        "repack didn't shrink: {shrunk_len} vs {big_len}"
+    );
+
+    // e2fsck must be clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(shrunk.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck on shrunk image failed:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // Content survived.
+    let cat = Command::new(FSTOOL)
+        .arg("cat")
+        .arg(shrunk.path())
+        .arg("/etc/conf")
+        .output()
+        .unwrap();
+    assert!(cat.status.success());
+    assert_eq!(cat.stdout, b"v=1\n");
+}
+
+/// `fstool repack` cross-FS-type: ext → FAT32.
+#[cfg(all(feature = "ext", feature = "fat"))]
+#[test]
+fn cli_repack_ext_to_fat32() {
+    if !which("fsck.vfat") || !which("mke2fs") {
+        eprintln!("skipping: fsck.vfat/mke2fs missing");
+        return;
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("README.txt"), b"cross-fs content\n").unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "8M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    let fat = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(fat.path())
+        .args(["--fs-type", "fat32", "--size", "64MiB"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack ext→fat32 failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let chk = Command::new("fsck.vfat")
+        .args(["-n", "-v"])
+        .arg(fat.path())
+        .output()
+        .unwrap();
+    assert!(
+        chk.status.success(),
+        "fsck.vfat failed on repacked FAT32:\n{}",
+        String::from_utf8_lossy(&chk.stdout)
+    );
+
+    let ls = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(fat.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        s.to_ascii_lowercase().contains("readme.txt"),
+        "missing README.txt in FAT32 output:\n{s}"
+    );
+}
+
+/// `fstool repack` preserves symlinks, mode, and uid/gid (ext → ext).
+/// Verifies that the direct FS-to-FS copier doesn't drop metadata that
+/// the previous host-tempdir staging implementation lost.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_repack_preserves_symlinks_and_mode() {
+    if !which("e2fsck") || !which("mke2fs") || !which("debugfs") {
+        eprintln!("skipping: e2fsprogs missing");
+        return;
+    }
+
+    // Build a source ext4 with a regular file (mode 0640), a relative
+    // symlink, and an absolute symlink — none of which the old
+    // staging path could reproduce without root.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("regular.txt"), b"keep me\n").unwrap();
+    std::os::unix::fs::symlink("regular.txt", srcdir.path().join("link-rel")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", srcdir.path().join("link-abs")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let p = srcdir.path().join("regular.txt");
+    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+    perms.set_mode(0o640);
+    std::fs::set_permissions(&p, perms).unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    let dst = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // debugfs reports per-inode mode + symlink targets.
+    let ls = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls -l /")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    // mode for regular.txt should be 0640 (octal "100640" = REG | 0640).
+    assert!(
+        listing.contains("100640"),
+        "mode 0640 not preserved on regular.txt:\n{listing}"
+    );
+
+    let abs = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /link-abs")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    let abs_out = String::from_utf8_lossy(&abs.stdout);
+    assert!(
+        abs_out.contains("/etc/passwd"),
+        "absolute symlink target lost:\n{abs_out}"
+    );
+
+    let rel = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /link-rel")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    let rel_out = String::from_utf8_lossy(&rel.stdout);
+    assert!(
+        rel_out.contains("regular.txt"),
+        "relative symlink target lost:\n{rel_out}"
+    );
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after repack:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+}
+
+/// `fstool repack` preserves ext xattrs through the FS-to-FS copy.
+/// Source is an mke2fs image with `debugfs ea_set`-stamped xattrs;
+/// destination must report identical values via `debugfs ea_get`.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_repack_preserves_xattrs() {
+    if !which("mke2fs") || !which("debugfs") || !which("e2fsck") {
+        eprintln!("skipping: e2fsprogs missing");
+        return;
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("withxattr.txt"), b"hi\n").unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    // Stamp xattrs onto the source via debugfs.
+    for cmd in [
+        r#"ea_set /withxattr.txt user.foo "hello-xattr""#,
+        r#"ea_set /withxattr.txt security.selinux "system_u:object_r:demo_t:s0""#,
+        r#"ea_set /withxattr.txt trusted.opaque "blob""#,
+    ] {
+        let out = Command::new("debugfs")
+            .args(["-w", "-R"])
+            .arg(cmd)
+            .arg(src.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "debugfs ea_set failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Repack with shrink.
+    let dst = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(dst.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "repack failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // e2fsck on destination must be clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after repack:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // Each xattr must round-trip via debugfs ea_get.
+    let cases = [
+        ("user.foo", "hello-xattr"),
+        ("security.selinux", "system_u:object_r:demo_t:s0"),
+        ("trusted.opaque", "blob"),
+    ];
+    for (name, expected) in cases {
+        let out = Command::new("debugfs")
+            .args(["-R"])
+            .arg(format!("ea_get /withxattr.txt {name}"))
+            .arg(dst.path())
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains(expected),
+            "xattr {name:?} lost or wrong:\nstdout:\n{s}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `fstool repack` from ext to tar and back: content, mode, symlinks,
+/// and xattrs all survive the round-trip.
+#[cfg(all(feature = "ext", feature = "tar"))]
+#[test]
+fn cli_repack_ext_tar_ext_preserves_metadata() {
+    if !which("mke2fs") || !which("debugfs") || !which("e2fsck") {
+        eprintln!("skipping: e2fsprogs missing");
+        return;
+    }
+
+    // Build a source ext4 with a file (mode 0640), a relative symlink,
+    // and a nested subdir.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("regular.txt"), b"file body\n").unwrap();
+    std::os::unix::fs::symlink("regular.txt", srcdir.path().join("link.txt")).unwrap();
+    std::fs::create_dir(srcdir.path().join("sub")).unwrap();
+    std::fs::write(srcdir.path().join("sub/inside.txt"), b"nested\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let p = srcdir.path().join("regular.txt");
+    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+    perms.set_mode(0o640);
+    std::fs::set_permissions(&p, perms).unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+    // Stamp xattrs on regular.txt.
+    Command::new("debugfs")
+        .args(["-w", "-R"])
+        .arg(r#"ea_set /regular.txt user.tag "from-ext""#)
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    // ext → tar
+    let dir = tempfile::tempdir().unwrap();
+    let tar = dir.path().join("intermediate.tar");
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(&tar)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ext → tar failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    // `file` reports POSIX tar archive.
+    let f = std::fs::read(&tar).unwrap();
+    assert_eq!(&f[257..262], b"ustar");
+
+    // List the tar via fstool itself — proves the tar reader works.
+    let ls = Command::new(FSTOOL)
+        .arg("ls")
+        .arg(&tar)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let s = String::from_utf8_lossy(&ls.stdout);
+    assert!(s.contains("regular.txt"));
+    assert!(s.contains("link.txt"));
+    assert!(s.contains("sub"));
+
+    // tar → ext (auto, uses ext4 because source is tar).
+    let back = NamedTempFile::new().unwrap();
+    let r = Command::new(FSTOOL)
+        .arg("repack")
+        .arg(&tar)
+        .arg(back.path())
+        .arg("--shrink")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "tar → ext failed:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Verify mode + uid/gid + symlink target + xattrs all survived.
+    let listing = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls -l /")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    let l = String::from_utf8_lossy(&listing.stdout);
+    assert!(l.contains("100640"), "mode 0640 not preserved:\n{l}");
+
+    let symlink = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /link.txt")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&symlink.stdout);
+    assert!(s.contains("regular.txt"), "symlink target lost:\n{s}");
+
+    let xattr = Command::new("debugfs")
+        .arg("-R")
+        .arg("ea_get /regular.txt user.tag")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&xattr.stdout);
+    assert!(
+        s.contains("from-ext"),
+        "user.tag xattr lost through ext → tar → ext:\n{s}"
+    );
+
+    // e2fsck on the round-tripped image.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(back.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed after ext → tar → ext:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+}
+
+/// fstool's tar reader is compatible with standard `tar -tvf`.
+#[cfg(all(feature = "ext", feature = "tar"))]
+#[test]
+fn cli_tar_archive_readable_by_system_tar() {
+    if !which("mke2fs") || !which("tar") {
+        eprintln!("skipping: mke2fs/tar missing");
+        return;
+    }
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hello"), b"hi\n").unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    Command::new("truncate")
+        .args(["-s", "16M"])
+        .arg(src.path())
+        .output()
+        .unwrap();
+    Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-d"])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .output()
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let tar = dir.path().join("out.tar");
+    Command::new(FSTOOL)
+        .arg("repack")
+        .arg(src.path())
+        .arg(&tar)
+        .output()
+        .unwrap();
+
+    let out = Command::new("tar")
+        .args(["-tf"])
+        .arg(&tar)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "system tar failed to list our archive"
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("hello"), "system tar didn't see /hello:\n{s}");
+}
+
+/// `analyze` on a host directory: human output carries the counts, and
+/// `--json` parses with the expected fields + a per-fs size map.
+#[cfg(all(feature = "ext", feature = "fat"))]
+#[test]
+fn cli_analyze_reports_counts_and_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    std::fs::write(dir.path().join("b.bin"), vec![0u8; 2000]).unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/c.txt"), b"0123456789").unwrap();
+
+    // Human output.
+    let out = Command::new(FSTOOL)
+        .arg("analyze")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "analyze failed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("files:     3"), "human output:\n{text}");
+    assert!(text.contains("dirs:      1"), "human output:\n{text}");
+
+    // JSON output.
+    let out = Command::new(FSTOOL)
+        .arg("analyze")
+        .arg(dir.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "analyze --json failed: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(v["files"], 3);
+    assert_eq!(v["dirs"], 1);
+    assert_eq!(v["symlinks"], 0);
+    assert_eq!(v["total_file_bytes"], 2015);
+    // recommended_size carries the block-FS targets.
+    assert!(v["recommended_size"]["ext4"].is_u64());
+    assert!(v["recommended_size"]["fat32"].is_u64());
+    // streamed outputs are absent.
+    assert!(v["recommended_size"].get("tar").is_none());
+}
+
+/// `fstool shell` / `add` / `rm` against a compressed image must
+/// refuse up front: with_target_device decompresses to a tempfile,
+/// any mutation lands on that tempfile, and it's silently lost when
+/// the tempfile drops — a data-loss footgun. The guard
+/// (`inspect::reject_compressed_for_mutation`) catches this before
+/// the tempfile is even created.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_mutators_refuse_compressed_inputs() {
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build a tiny ext2 image, then gzip a copy.
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"a\n").unwrap();
+    let img = dir.path().join("e.img");
+    let r = Command::new(bin)
+        .args(["create", "-t", "ext2", "-o"])
+        .arg(&img)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    // gzip via the host tool — the test only needs *some* `.gz` file
+    // alongside the real one. Skip if gzip isn't present.
+    if !Command::new("sh")
+        .arg("-c")
+        .arg("command -v gzip")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("skipping: gzip not installed");
+        return;
+    }
+    let st = Command::new("gzip").arg("-k").arg(&img).status().unwrap();
+    assert!(st.success(), "gzip failed");
+    let img_gz = dir.path().join("e.img.gz");
+    let host = dir.path().join("host.txt");
+    std::fs::write(&host, b"h\n").unwrap();
+
+    // add against .gz must refuse.
+    let r = Command::new(bin)
+        .arg("add")
+        .arg(&img_gz)
+        .arg(&host)
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "add on .gz should have failed");
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(err.contains("cannot mutate a gzip"), "wrong error: {err}");
+
+    // rm against .gz must refuse.
+    let r = Command::new(bin)
+        .arg("rm")
+        .arg(&img_gz)
+        .arg("/a.txt")
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "rm on .gz should have failed");
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("cannot mutate a gzip"),
+        "wrong error: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // shell against .gz must refuse.
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg(&img_gz)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "shell on .gz should have failed");
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("cannot mutate a gzip"),
+        "wrong error: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // The original ext.img is untouched (sanity — no tempfile spew
+    // landed back on disk by mistake).
+    let ls = Command::new(bin)
+        .arg("ls")
+        .arg(&img)
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        !listing.contains("added.txt"),
+        "added.txt leaked into original: {listing}"
+    );
+}
+
+/// `fstool shell` on a filesystem whose mutation_capability isn't
+/// add/remove-capable (tar, ISO 9660, SquashFS, …) must refuse up
+/// front. The shell's whole point is in-place mutation via put/rm —
+/// opening a streaming FS in shell mode is misleading. The user is
+/// pointed at `fstool ls` / `fstool cat` for read-only browsing.
+#[cfg(feature = "tar")]
+#[test]
+fn cli_shell_refuses_streaming_filesystem() {
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"a\n").unwrap();
+    let tar = dir.path().join("t.tar");
+    let st = Command::new("tar")
+        .arg("-cf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("src")
+        .status()
+        .unwrap();
+    assert!(st.success(), "tar failed");
+
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg(&tar)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "shell on tar should have failed");
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(err.contains("streaming"), "wrong error: {err}");
+    assert!(err.contains("fstool ls"), "missing browse hint: {err}");
+}
+
+/// `fstool shell --ro` opens the image read-only:
+/// - tar / tar.gz (streaming + compressed) are legal browse targets;
+/// - put / rm / mkdir refuse with a "shell is read-only" message;
+/// - the original on-disk image's bytes are unchanged after a session.
+#[cfg(all(feature = "ext", feature = "tar", feature = "gzip"))]
+#[test]
+fn cli_shell_ro_browses_immutable_and_keeps_image_bytes() {
+    let bin = env!("CARGO_BIN_EXE_fstool");
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build inputs: a tiny dir, an ext.img, and a tar.gz of the dir.
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"a\n").unwrap();
+
+    let ext_img = dir.path().join("e.img");
+    let r = Command::new(bin)
+        .args(["create", "-t", "ext2", "-o"])
+        .arg(&ext_img)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let tar_gz = dir.path().join("t.tar.gz");
+    let st = Command::new("tar")
+        .arg("-czf")
+        .arg(&tar_gz)
+        .arg("-C")
+        .arg(dir.path())
+        .arg("src")
+        .status()
+        .unwrap();
+    assert!(st.success(), "tar failed");
+
+    let host = dir.path().join("host.txt");
+    std::fs::write(&host, b"x\n").unwrap();
+
+    // --- shell --ro on tar.gz: ls works (streaming source now allowed)
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg("--ro")
+        .arg(&tar_gz)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = r;
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"ls\nquit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "shell --ro on tar.gz failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("src"),
+        "no src/ in listing"
+    );
+
+    // --- shell --ro on ext.img: put is refused, image untouched
+    let bytes_before = std::fs::read(&ext_img).unwrap();
+    let mut child = Command::new(bin)
+        .arg("shell")
+        .arg("--ro")
+        .arg(&ext_img)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "ls").unwrap();
+        writeln!(stdin, "put {} /attempted.txt", host.display()).unwrap();
+        writeln!(stdin, "rm /a.txt").unwrap();
+        writeln!(stdin, "mkdir /newdir").unwrap();
+        writeln!(stdin, "quit").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "shell --ro on ext.img failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each of put/rm/mkdir surfaces the read-only refusal.
+    for cmd in ["put", "rm", "mkdir"] {
+        assert!(
+            stdout.contains(&format!("{cmd}: shell is read-only")),
+            "{cmd} not refused: {stdout}"
+        );
+    }
+    let bytes_after = std::fs::read(&ext_img).unwrap();
+    assert_eq!(bytes_before, bytes_after, "shell --ro mutated the image");
+
+    // --- shell (no --ro) on tar still refused (commit-A capability gate)
+    let r = Command::new(bin)
+        .arg("shell")
+        .arg(&tar_gz)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !r.status.success(),
+        "shell w/o --ro on tar.gz should still fail"
+    );
+}
+
+/// `ls -R` walks a nested tree, prints a `path:` header per directory, and
+/// crucially terminates — never recursing into the `.`/`..` self/parent links
+/// that ext (and a `tar c .`) surface. Regression guard against the
+/// self-referential infinite recursion that an unguarded walker hits.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_ls_recursive_walks_tree_and_terminates() {
+    let bin = FSTOOL;
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("a/b/c")).unwrap();
+    std::fs::create_dir_all(src.path().join("d")).unwrap();
+    std::fs::write(src.path().join("top.txt"), b"hi\n").unwrap();
+    std::fs::write(src.path().join("a/f1"), b"x\n").unwrap();
+    std::fs::write(src.path().join("a/b/f2"), b"y\n").unwrap();
+    std::fs::write(src.path().join("a/b/c/f3"), b"z\n").unwrap();
+    std::fs::write(src.path().join("d/f4"), b"w\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(bin)
+        .arg("create")
+        .arg("-t")
+        .arg("ext4")
+        .arg(src.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create -t ext4 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin)
+        .arg("ls")
+        .arg("-R")
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ls -R failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+
+    // A header per directory, at every depth.
+    for header in ["/:", "/a:", "/a/b:", "/a/b/c:", "/d:"] {
+        assert!(s.contains(header), "missing {header} header in:\n{s}");
+    }
+    // Every leaf file is listed somewhere.
+    for f in ["top.txt", "f1", "f2", "f3", "f4"] {
+        assert!(s.contains(f), "missing file {f} in:\n{s}");
+    }
+    // The `.` / `..` links are never descended (would emit a `/.:` header).
+    assert!(!s.contains("/.:"), "recursed into '.':\n{s}");
+    assert!(!s.contains("/..:"), "recursed into '..':\n{s}");
+}
+
+/// `--path-style` is accepted, and on a `/`-native filesystem (ext) `native`
+/// is a no-op equal to the default `unix`. (HFS/HFS+ native behaviour — where
+/// the separator actually differs — is exercised by the path_style unit tests
+/// and the HFS/HFS+ reader fixtures; it needs a Mac volume the CLI tests don't
+/// fabricate.)
+#[cfg(feature = "ext")]
+#[test]
+fn cli_path_style_flag_is_a_noop_on_ext() {
+    let bin = FSTOOL;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("dir")).unwrap();
+    std::fs::write(src.path().join("dir/f"), b"x\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(bin)
+        .args(["create", "-t", "ext4"])
+        .arg(src.path())
+        .arg("-o")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "create failed");
+
+    let run = |style: &str| {
+        let o = Command::new(bin)
+            .args(["ls", "-R", "--path-style", style])
+            .arg(img.path())
+            .arg("/")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "ls -R --path-style {style} failed");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    // Native and unix produce identical output for an ext filesystem, and the
+    // default (no flag) matches unix.
+    assert_eq!(run("unix"), run("native"));
+    let default = Command::new(bin)
+        .args(["ls", "-R"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&default.stdout), run("unix"));
+}
+
+/// `fstool create -t hfs` builds a classic-HFS volume that reads back through
+/// fstool byte-for-byte. When a *working* HFS checker is present (macOS
+/// `fsck_hfs` — the Linux `fsck.hfsplus` segfaults on classic HFS and is
+/// deliberately not used), the volume is validated against it too.
+#[cfg(feature = "hfs")]
+#[test]
+fn cli_create_hfs_round_trip() {
+    let bin = FSTOOL;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("docs")).unwrap();
+    std::fs::write(src.path().join("readme.txt"), b"hello classic HFS\n").unwrap();
+    std::fs::write(src.path().join("docs/note.txt"), b"a nested note\n").unwrap();
+    // A binary blob to confirm an exact data-fork round-trip.
+    let blob: Vec<u8> = (0..9000u32).map(|i| (i * 7) as u8).collect();
+    std::fs::write(src.path().join("blob.bin"), &blob).unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let out = Command::new(bin)
+        .args(["create", "-t", "hfs"])
+        .arg(src.path())
+        .args(["-o"])
+        .arg(img.path())
+        .args(["--label", "TestHFS", "--size", "8MiB"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create -t hfs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Listing shows the tree.
+    let ls = Command::new(bin)
+        .args(["ls", "-R"])
+        .arg(img.path())
+        .arg("/")
+        .output()
+        .unwrap();
+    assert!(ls.status.success());
+    let listing = String::from_utf8_lossy(&ls.stdout);
+    for name in ["readme.txt", "docs", "note.txt", "blob.bin"] {
+        assert!(listing.contains(name), "missing {name} in:\n{listing}");
+    }
+
+    // The binary blob round-trips exactly.
+    let cat = Command::new(bin)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/blob.bin")
+        .output()
+        .unwrap();
+    assert!(cat.status.success());
+    assert_eq!(cat.stdout, blob, "blob.bin data fork differs");
+
+    // Optional real-checker validation on the macOS runner. `fsck_hfs` needs a
+    // device node (it ioctls for the block size), so attach the raw image via
+    // `hdiutil` to get `/dev/diskN`, fsck the raw device, then detach. Any
+    // infrastructure hiccup (tool missing, attach refused) skips; we only assert
+    // on an actual `fsck_hfs` verdict — exit 0 means a clean volume.
+    if which("fsck_hfs") && which("hdiutil") {
+        validate_hfs_with_fsck(img.path());
+    } else {
+        eprintln!("skipping fsck_hfs oracle: macOS-only (Linux fsck.hfsplus segfaults on HFS)");
+    }
+}
+
+#[cfg(all(feature = "hfs", target_os = "macos"))]
+fn validate_hfs_with_fsck(img: &std::path::Path) {
+    let attach = Command::new("hdiutil")
+        .args([
+            "attach",
+            "-nomount",
+            "-imagekey",
+            "diskimage-class=CRawDiskImage",
+        ])
+        .arg(img)
+        .output()
+        .unwrap();
+    if !attach.status.success() {
+        eprintln!(
+            "skipping fsck_hfs: hdiutil attach failed: {}",
+            String::from_utf8_lossy(&attach.stderr)
+        );
+        return;
+    }
+    let out = String::from_utf8_lossy(&attach.stdout);
+    let dev = out
+        .split_whitespace()
+        .find(|t| t.starts_with("/dev/disk"))
+        .unwrap_or("")
+        .to_string();
+    if !dev.starts_with("/dev/disk") {
+        eprintln!("skipping fsck_hfs: no device node in hdiutil output:\n{out}");
+        return;
+    }
+    let raw = dev.replace("/dev/disk", "/dev/rdisk");
+    let chk = Command::new("fsck_hfs")
+        .args(["-n", "-f"])
+        .arg(&raw)
+        .output();
+    let _ = Command::new("hdiutil").arg("detach").arg(&dev).output();
+    let chk = chk.unwrap();
+    assert!(
+        chk.status.success(),
+        "fsck_hfs flagged the volume:\n{}\n{}",
+        String::from_utf8_lossy(&chk.stdout),
+        String::from_utf8_lossy(&chk.stderr)
+    );
+}
+
+#[cfg(all(feature = "hfs", not(target_os = "macos")))]
+fn validate_hfs_with_fsck(_img: &std::path::Path) {}
+
+/// In-place mutation of an existing classic-HFS image: `fstool add` and `rm`
+/// each open the volume writable, mutate, flush, and persist across separate
+/// invocations, leaving unrelated files intact.
+#[cfg(feature = "hfs")]
+#[test]
+fn cli_hfs_in_place_add_and_remove() {
+    let bin = FSTOOL;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("old.txt"), b"to be removed\n").unwrap();
+    std::fs::create_dir_all(src.path().join("keep")).unwrap();
+    std::fs::write(src.path().join("keep/inner.txt"), b"survivor\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let ok = Command::new(bin)
+        .args(["create", "-t", "hfs"])
+        .arg(src.path())
+        .arg("-o")
+        .arg(img.path())
+        .args(["--size", "4MiB"])
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // add a new file (separate process → exercises open_writable + flush).
+    let host = NamedTempFile::new().unwrap();
+    std::fs::write(host.path(), b"freshly added\n").unwrap();
+    let add = Command::new(bin)
+        .arg("add")
+        .arg(img.path())
+        .arg(host.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    // remove an existing file (another separate process).
+    let rm = Command::new(bin)
+        .arg("rm")
+        .arg(img.path())
+        .arg("/old.txt")
+        .output()
+        .unwrap();
+    assert!(
+        rm.status.success(),
+        "rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    // Reopen read-only and confirm persistence.
+    let listing = String::from_utf8_lossy(
+        &Command::new(bin)
+            .args(["ls", "-R"])
+            .arg(img.path())
+            .arg("/")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
+    assert!(
+        listing.contains("added.txt"),
+        "added.txt missing:\n{listing}"
+    );
+    assert!(
+        !listing.contains("old.txt"),
+        "old.txt should be gone:\n{listing}"
+    );
+    assert!(
+        listing.contains("inner.txt"),
+        "preserved file missing:\n{listing}"
+    );
+
+    let cat = Command::new(bin)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/added.txt")
+        .output()
+        .unwrap();
+    assert_eq!(cat.stdout, b"freshly added\n");
+    let cat2 = Command::new(bin)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/keep/inner.txt")
+        .output()
+        .unwrap();
+    assert_eq!(cat2.stdout, b"survivor\n");
+
+    // fsck the mutated volume too (macOS runner only).
+    if which("fsck_hfs") && which("hdiutil") {
+        validate_hfs_with_fsck(img.path());
+    }
+}
+
+/// Run `fstool shell IMG`, feeding `script` on stdin. Returns the captured
+/// stdout and whether the process exited successfully.
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
+fn shell_script(img: &std::path::Path, script: &str) -> (String, bool) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(FSTOOL)
+        .arg("shell")
+        .arg(img)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// Regression guard, at the *CLI* layer, for the `AnyFs::flush` data-loss
+/// bug: `fstool shell` → `put FILE /dest` → `quit`, with **no** intervening
+/// read, must leave the file readable on reopen.
+///
+/// Every other test reopens through the library (`inspect::open`), which
+/// reaches the `Filesystem` trait flush — the path the bug was *not* in.
+/// Only spawning the real binary exercises `AnyFs::flush`, the wrapper the
+/// shell actually calls. This drove silent data loss on NTFS / XFS / exFAT
+/// (DirBatch) and HFS+ (catalog) until the wrapper was made to delegate.
+///
+/// The body is 6 KiB so it is non-resident on NTFS and spans past exFAT's
+/// first cluster — i.e. it needs a real on-disk directory entry plus data
+/// runs, exactly what the dropped flush used to lose. Needs no external
+/// tool: a fresh `fstool` process reads it back, so this runs everywhere.
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "hfs-plus",
+    feature = "apfs"
+))]
+#[test]
+fn cli_shell_put_quit_persists_across_backends() {
+    let body: Vec<u8> = (0..6144).map(|i| (i % 251) as u8).collect();
+    let host = NamedTempFile::new().unwrap();
+    std::fs::write(host.path(), &body).unwrap();
+
+    // Every filesystem `fstool create` can format and then mutate on reopen.
+    let cases = [
+        #[cfg(feature = "ext")]
+        ("ext4", "32M"),
+        #[cfg(feature = "fat")]
+        ("fat32", "64M"),
+        #[cfg(feature = "exfat")]
+        ("exfat", "64M"),
+        #[cfg(feature = "ntfs")]
+        ("ntfs", "32M"),
+        #[cfg(feature = "xfs")]
+        ("xfs", "300M"),
+        #[cfg(feature = "hfs-plus")]
+        ("hfs+", "16M"),
+        #[cfg(feature = "apfs")]
+        ("apfs", "32M"),
+    ];
+
+    for (ty, size) in cases {
+        let img = NamedTempFile::new().unwrap();
+        let create = Command::new(FSTOOL)
+            .args(["create", "--type", ty, "--size", size, "-o"])
+            .arg(img.path())
+            .output()
+            .unwrap();
+        assert!(
+            create.status.success(),
+            "{ty}: create failed: {}",
+            String::from_utf8_lossy(&create.stderr)
+        );
+
+        // The exact failing sequence: put then quit, nothing in between.
+        let (_out, ok) = shell_script(
+            img.path(),
+            &format!("put {} /f.bin\nquit\n", host.path().display()),
+        );
+        assert!(ok, "{ty}: `shell` exited non-zero on put;quit");
+
+        // Reopen with a brand-new process and read it back.
+        let cat = Command::new(FSTOOL)
+            .arg("cat")
+            .arg(img.path())
+            .arg("/f.bin")
+            .output()
+            .unwrap();
+        assert!(
+            cat.status.success(),
+            "{ty}: `cat` after put;quit failed (entry lost?): {}",
+            String::from_utf8_lossy(&cat.stderr)
+        );
+        assert_eq!(
+            cat.stdout, body,
+            "{ty}: put;quit lost or corrupted the file body"
+        );
+
+        // Where the native NTFS driver is installed, prove the bytes are
+        // readable by a real driver (what WinXP would see), not just fstool.
+        if ty == "ntfs" && which("ntfscat") {
+            let nc = Command::new("ntfscat")
+                .arg(img.path())
+                .arg("/f.bin")
+                .output()
+                .unwrap();
+            assert!(
+                nc.status.success() && nc.stdout == body,
+                "ntfs: ntfs-3g could not read back the file written via shell put;quit"
+            );
+        }
+    }
+}
+
+/// `fstool shell` quoting: a filename containing spaces round-trips only when
+/// quoted (single or double), and an unquoted space is treated as an argument
+/// separator (error), not silently joined.
+#[cfg(feature = "ext")]
+#[test]
+fn cli_shell_quoted_paths() {
+    let srcdir = tempfile::tempdir().unwrap();
+    let hostfile = srcdir.path().join("my file.txt");
+    std::fs::write(&hostfile, b"quoted body\n").unwrap();
+
+    let img = NamedTempFile::new().unwrap();
+    let create = Command::new(FSTOOL)
+        .args(["create", "--type", "ext4", "--size", "16M", "-o"])
+        .arg(img.path())
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+
+    // Double-quoted host + image paths; single-quoted dir.
+    let script = format!(
+        "mkdir 'a dir'\nput \"{}\" \"/a dir/has space.txt\"\nls \"/a dir\"\nquit\n",
+        hostfile.display()
+    );
+    let (out, ok) = shell_script(img.path(), &script);
+    assert!(ok, "shell exited non-zero: {out}");
+    assert!(
+        out.contains("has space.txt"),
+        "quoted spaced filename not listed: {out:?}"
+    );
+
+    // Read it back by a fresh process using a single-quoted path.
+    let cat = Command::new(FSTOOL)
+        .arg("cat")
+        .arg(img.path())
+        .arg("/a dir/has space.txt")
+        .output()
+        .unwrap();
+    assert!(cat.status.success(), "cat of spaced path failed");
+    assert_eq!(cat.stdout, b"quoted body\n");
+
+    // An *unquoted* space must error (require quotes), not silently split.
+    let (out, _) = shell_script(img.path(), "cd /a dir\nquit\n");
+    assert!(
+        out.contains("too many arguments"),
+        "unquoted spaced path should be rejected: {out:?}"
+    );
+}
+
+/// `put` preserves the host file's mtime (it used to drop every timestamp to
+/// zero). Checked on every backend whose getattr round-trips mtime: ext4,
+/// fat32, exfat, ntfs. (fat32/exfat have 2-second resolution, so the host
+/// mtime is an even second.)
+#[cfg(any(
+    feature = "ext",
+    feature = "fat",
+    feature = "exfat",
+    feature = "ntfs",
+    feature = "hfs-plus"
+))]
+// With a single filesystem compiled in the table below has one row.
+#[allow(clippy::single_element_loop)]
+#[test]
+fn cli_shell_put_preserves_mtime() {
+    use std::time::{Duration, SystemTime};
+
+    let srcdir = tempfile::tempdir().unwrap();
+    let hostfile = srcdir.path().join("dated.txt");
+    std::fs::write(&hostfile, b"has a date\n").unwrap();
+    // A fixed, non-zero, even-second mtime well in the past (2021-03-15).
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_615_779_296);
+    let f = std::fs::File::options()
+        .write(true)
+        .open(&hostfile)
+        .unwrap();
+    f.set_modified(when).unwrap();
+    drop(f);
+
+    for (ty, size) in [
+        #[cfg(feature = "ext")]
+        ("ext4", "16M"),
+        #[cfg(feature = "fat")]
+        ("fat32", "64M"),
+        #[cfg(feature = "exfat")]
+        ("exfat", "64M"),
+        #[cfg(feature = "ntfs")]
+        ("ntfs", "32M"),
+        #[cfg(feature = "hfs-plus")]
+        ("hfs+", "32M"),
+    ] {
+        let img = NamedTempFile::new().unwrap();
+        assert!(
+            Command::new(FSTOOL)
+                .args(["create", "--type", ty, "--size", size, "-o"])
+                .arg(img.path())
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{ty}: create failed"
+        );
+
+        let (out, ok) = shell_script(
+            img.path(),
+            &format!("put \"{}\" /dated.txt\nquit\n", hostfile.display()),
+        );
+        assert!(ok, "{ty}: put failed: {out}");
+
+        // `info` reports `mtime:  <epoch>  (...)`. It must be the host value.
+        let (info, ok) = shell_script(img.path(), "info /dated.txt\nquit\n");
+        assert!(ok, "{ty}: info failed: {info}");
+        let mtime_line = info
+            .lines()
+            .find(|l| l.trim_start().starts_with("mtime:"))
+            .unwrap_or("");
+        assert!(
+            mtime_line.contains("1615779296"),
+            "{ty}: put did not preserve host mtime (line: {mtime_line:?})"
+        );
+    }
+}
+
+/// `chmod MODE PATH` works across every writable backend via the real shell
+/// binary. Filesystems with Unix modes (ext) store the bits; DOS-attribute
+/// filesystems (NTFS/FAT/exFAT) map the owner-write bit to READ-ONLY, so a
+/// `chmod 444` reads back as 0o444 and `chmod 644` as 0o644 everywhere.
+#[cfg(any(
+    feature = "ext",
+    feature = "ntfs",
+    feature = "xfs",
+    feature = "fat",
+    feature = "exfat",
+    feature = "hfs-plus"
+))]
+// With a single filesystem compiled in the table below has one row.
+#[allow(clippy::single_element_loop)]
+#[test]
+fn cli_shell_chmod_across_backends() {
+    let srcdir = tempfile::tempdir().unwrap();
+    let hostfile = srcdir.path().join("f.txt");
+    std::fs::write(&hostfile, b"perm test\n").unwrap();
+
+    // Sizes chosen to satisfy each backend's minimum.
+    for (ty, size) in [
+        #[cfg(feature = "ext")]
+        ("ext4", "16M"),
+        #[cfg(feature = "ntfs")]
+        ("ntfs", "32M"),
+        #[cfg(feature = "xfs")]
+        ("xfs", "300M"),
+        #[cfg(feature = "fat")]
+        ("fat32", "64M"),
+        #[cfg(feature = "exfat")]
+        ("exfat", "64M"),
+        #[cfg(feature = "hfs-plus")]
+        ("hfs+", "32M"),
+    ] {
+        let img = NamedTempFile::new().unwrap();
+        assert!(
+            Command::new(FSTOOL)
+                .args(["create", "--type", ty, "--size", size, "-o"])
+                .arg(img.path())
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "{ty}: create failed"
+        );
+
+        // put → chmod 444 → read mode (fresh process each time).
+        let script = format!(
+            "put \"{}\" /f.txt\nchmod 444 /f.txt\nquit\n",
+            hostfile.display()
+        );
+        let (out, ok) = shell_script(img.path(), &script);
+        assert!(ok, "{ty}: put+chmod failed: {out}");
+
+        let mode_of = |img: &std::path::Path| -> String {
+            let (info, ok) = shell_script(img, "info /f.txt\nquit\n");
+            assert!(ok, "{ty}: info failed: {info}");
+            info.lines()
+                .find(|l| l.trim_start().starts_with("mode:"))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                        .map(|s| s.trim_start_matches('0').to_string())
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(mode_of(img.path()), "444", "{ty}: chmod 444 not reflected");
+
+        let (out, ok) = shell_script(img.path(), "chmod 644 /f.txt\nquit\n");
+        assert!(ok, "{ty}: chmod 644 failed: {out}");
+        assert_eq!(mode_of(img.path()), "644", "{ty}: chmod 644 not reflected");
+    }
+}
+
+// ------------------------------------- encrypted images and overlays
+
+/// Run `fstool` with `args`, asserting it succeeded.
+#[cfg(all(feature = "ext", any(feature = "luks", feature = "qcow2")))]
+fn fstool(args: &[&str]) -> String {
+    let out = Command::new(FSTOOL)
+        .args(args)
+        .output()
+        .expect("spawning fstool");
+    assert!(
+        out.status.success(),
+        "fstool {args:?} failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A tiny source tree for the create commands below.
+#[cfg(all(feature = "ext", any(feature = "luks", feature = "qcow2")))]
+fn fixture_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("hello.txt"), b"hello encrypted world\n").unwrap();
+    std::fs::write(dir.path().join("sub/nested.txt"), b"nested\n").unwrap();
+    dir
+}
+
+/// `--encrypt-kdf-*` at the floor, so the tests don't spend seconds in a
+/// KDF that is deliberately expensive in real use.
+#[cfg(all(feature = "luks", feature = "ext"))]
+const CHEAP_KDF: [&str; 4] = ["--encrypt-kdf-iterations", "1", "--encrypt-kdf-memory", "8"];
+
+/// `create --encrypt` on a raw destination makes a LUKS volume that
+/// cryptsetup recognises and that fstool itself can walk back.
+#[test]
+#[cfg(all(feature = "luks", feature = "ext"))]
+fn cli_creates_a_luks_volume() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("secret.img");
+    let img_s = img.to_str().unwrap();
+
+    let mut args = vec![
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "16M",
+        "-o",
+        img_s,
+        tree.path().to_str().unwrap(),
+        "--encrypt",
+        "--password",
+        "hunter2",
+    ];
+    args.extend_from_slice(&CHEAP_KDF);
+    fstool(&args);
+
+    // Without a passphrase, opening must fail — and say why.
+    let out = Command::new(FSTOOL)
+        .args(["ls", img_s, "/"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("LUKS"), "unhelpful error: {err}");
+
+    // With one, the filesystem is right there.
+    let listing = fstool(&["ls", img_s, "/", "--password", "hunter2"]);
+    assert!(listing.contains("hello.txt"), "{listing}");
+    let body = fstool(&["cat", img_s, "/hello.txt", "--password", "hunter2"]);
+    assert_eq!(body, "hello encrypted world\n");
+
+    // `info` leads with the container.
+    let info = fstool(&["info", img_s, "--password", "hunter2"]);
+    assert!(info.contains("LUKS2"), "{info}");
+    assert!(info.contains("aes-xts-plain64"), "{info}");
+
+    if which("cryptsetup") {
+        let dump = Command::new("cryptsetup")
+            .arg("luksDump")
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(
+            dump.status.success(),
+            "cryptsetup rejected the header we wrote: {}",
+            String::from_utf8_lossy(&dump.stderr)
+        );
+    }
+}
+
+/// The same, but the destination is a qcow2 — which gets qcow2's own
+/// embedded-LUKS encryption instead.
+#[test]
+#[cfg(all(feature = "qcow2-crypto", feature = "ext"))]
+fn cli_creates_an_encrypted_qcow2() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("secret.qcow2");
+    let img_s = img.to_str().unwrap();
+
+    let mut args = vec![
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "16M",
+        "-o",
+        img_s,
+        tree.path().to_str().unwrap(),
+        "--encrypt",
+        "--password",
+        "hunter2",
+    ];
+    args.extend_from_slice(&CHEAP_KDF);
+    fstool(&args);
+
+    let info = fstool(&["info", img_s, "--password", "hunter2"]);
+    assert!(info.contains("qcow2"), "{info}");
+    assert!(info.contains("encryption:"), "{info}");
+    let body = fstool(&["cat", img_s, "/hello.txt", "--password", "hunter2"]);
+    assert_eq!(body, "hello encrypted world\n");
+
+    if which("qemu-img") {
+        let check = Command::new("qemu-img")
+            .arg("check")
+            .arg("--object")
+            .arg("secret,id=sec0,data=hunter2")
+            .arg("--image-opts")
+            .arg(format!(
+                "driver=qcow2,file.filename={},encrypt.key-secret=sec0",
+                img.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "qemu-img check failed: {}{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+}
+
+/// `--password-file` is the form that keeps the passphrase out of `ps`.
+#[test]
+#[cfg(all(feature = "luks", feature = "ext"))]
+fn cli_reads_the_passphrase_from_a_file() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("pwfile.img");
+    let img_s = img.to_str().unwrap();
+    let pw = dir.path().join("pw.txt");
+    // With a trailing newline, as `echo` would leave it.
+    std::fs::write(&pw, b"from a file\n").unwrap();
+    let pw_s = pw.to_str().unwrap();
+
+    let mut args = vec![
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "16M",
+        "-o",
+        img_s,
+        tree.path().to_str().unwrap(),
+        "--encrypt",
+        "--password-file",
+        pw_s,
+    ];
+    args.extend_from_slice(&CHEAP_KDF);
+    fstool(&args);
+
+    // The newline must have been stripped: the inline form has to match.
+    let listing = fstool(&["ls", img_s, "/", "--password", "from a file"]);
+    assert!(listing.contains("hello.txt"), "{listing}");
+    let listing = fstool(&["ls", img_s, "/", "--password-file", pw_s]);
+    assert!(listing.contains("hello.txt"), "{listing}");
+}
+
+/// `create --backing` makes a qcow2 overlay: `info` reports the base, and
+/// the overlay is far smaller than the image it reads through to.
+#[cfg(all(feature = "ext", feature = "qcow2"))]
+#[test]
+fn cli_creates_a_qcow2_overlay() {
+    let tree = fixture_tree();
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.qcow2");
+    let overlay = dir.path().join("overlay.qcow2");
+
+    fstool(&[
+        "create",
+        "-t",
+        "ext4",
+        "--size",
+        "32M",
+        "-o",
+        base.to_str().unwrap(),
+        tree.path().to_str().unwrap(),
+    ]);
+    fstool(&[
+        "create",
+        "-t",
+        "ext2",
+        "--size",
+        "32M",
+        "-o",
+        overlay.to_str().unwrap(),
+        "--backing",
+        "base.qcow2",
+        "--backing-format",
+        "qcow2",
+    ]);
+
+    let info = fstool(&["info", overlay.to_str().unwrap()]);
+    assert!(
+        info.contains("backing file:      base.qcow2 (format qcow2)"),
+        "{info}"
+    );
+    // The overlay carries only its own filesystem, not the base's data.
+    let overlay_len = std::fs::metadata(&overlay).unwrap().len();
+    assert!(
+        overlay_len < 4 * 1024 * 1024,
+        "overlay is {overlay_len} bytes — it should hold only its deltas"
+    );
+
+    if which("qemu-img") {
+        let check = Command::new("qemu-img")
+            .arg("check")
+            .arg(&overlay)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "qemu-img check rejected our overlay: {}{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+}
+
+/// `--encrypt` with no passphrase must be refused up front, not part-way
+/// through writing an image.
+#[test]
+#[cfg(all(feature = "luks", feature = "ext"))]
+fn cli_refuses_encrypt_without_a_passphrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("nope.img");
+    let out = Command::new(FSTOOL)
+        .args([
+            "create",
+            "-t",
+            "ext4",
+            "--size",
+            "16M",
+            "-o",
+            img.to_str().unwrap(),
+            "--encrypt",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("passphrase"), "unhelpful error: {err}");
+    assert!(!img.exists(), "a rejected create left an image behind");
+}

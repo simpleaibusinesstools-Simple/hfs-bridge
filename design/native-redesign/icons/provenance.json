@@ -1,0 +1,104 @@
+[
+  {
+    "Name": "arrow_clockwise.svg",
+    "SHA256": "488566EEF8203823292A19660C47D4B9C86CA64E6910848342E6B5FA3C5A7558",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "arrow_right.svg",
+    "SHA256": "4F415858D01FCE575CF40C9A17F336EA848017B5697CCB464F6E0789116D60E3",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "chevron_down.svg",
+    "SHA256": "52B3569967DCD33B226BD19A7CB3BF1BF491DD22822C4C3A8D36F80CB6612FFA",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "database.svg",
+    "SHA256": "E57C4C83C2016D47554CC5B63A94BB23E5EBD0451D00A45B3A26DC75F66A068D",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "dismiss.svg",
+    "SHA256": "F23A501BE08E93AD334F1705BE0C9E8224A8E7457BD884FE59263DB1C6A4F3DC",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "document.svg",
+    "SHA256": "C70164C6EE7F495A3BB4978DE76628E166D6BA5B52210A016DDCFE35138528B1",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "folder.svg",
+    "SHA256": "B223F863F213DCC1BF75A65D31A287830380C08503C79565B317C77B10E7A2E1",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "hard_drive.svg",
+    "SHA256": "449F9E9317D7F8AB52EE11E7F5B641A635CEEF3EBFEBAFD2770AE053BB982F54",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "info.svg",
+    "SHA256": "EC9891767B25630079FACA1B06026CAB94EEE56129DC1264A40D256AA65911BB",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "layer.svg",
+    "SHA256": "DEC6ABAD042FF0DF99EE34CD97ADE5C3CC35D03B029DC1158E913A0579F7966C",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "LICENSE.txt",
+    "SHA256": "69BC45DC42B9ACB96A69823ADBC6AE538374E3C0BDE169B855B32C48EAAEF52F",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "lock_closed.svg",
+    "SHA256": "589E952219E9F3F018B33BEBC9E2FE9AC8038CF2DB5BC03350D5FF20A13DCD60",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "lock_open.svg",
+    "SHA256": "FDC90527C5838060E239E92A9A4EA4AC21F80EB58565ED78133E8E41C1AE6B32",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "plug_connected.svg",
+    "SHA256": "5082C942DFB966A9D15F3EB9A0692157D9B48B1EFBBE7E5CC7988305E3BCE956",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "settings.svg",
+    "SHA256": "5AC05E6E11C9EC9F24703091C42CA1F5C91F4032CB0EEE35C892D1872A38871B",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "square.svg",
+    "SHA256": "12323EA35CF41E62D11A2E73303D20E03DEC20CB3727EB3A41BE6A6C954BE30F",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  },
+  {
+    "Name": "subtract.svg",
+    "SHA256": "8C2E073D38E1442D7726F60DD7886DFF5B498550CDF030FAE6102ADAC5859F0C",
+    "Source": "https://github.com/microsoft/fluentui-system-icons",
+    "License": "MIT"
+  }
+]

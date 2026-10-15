@@ -1,0 +1,2465 @@
+//! Unit tests for the NTFS read implementation.
+//!
+//! We hand-craft minimal NTFS-like images (no `mkntfs` available) and
+//! verify each layer in isolation: boot decode, USA fixup, attribute
+//! walk, $INDEX_ROOT decode, then a full `list_path` / `open_file_reader`
+//! / `read_xattrs` round trip on a single-directory image.
+
+use super::*;
+use crate::block::MemoryBackend;
+
+const BPS: u16 = 512;
+const SPC: u8 = 8; // 4 KiB clusters
+const REC_SIZE: u32 = 1024; // 1 KiB MFT record
+
+fn fake_boot(bps: u16, spc: u8, mft_lcn: u64, mft_rec: i8) -> Vec<u8> {
+    let mut v = vec![0u8; 512];
+    v[0..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+    v[3..11].copy_from_slice(boot::NTFS_OEM);
+    v[11..13].copy_from_slice(&bps.to_le_bytes());
+    v[13] = spc;
+    v[0x28..0x30].copy_from_slice(&1024u64.to_le_bytes());
+    v[0x30..0x38].copy_from_slice(&mft_lcn.to_le_bytes());
+    v[0x38..0x40].copy_from_slice(&(mft_lcn + 1).to_le_bytes());
+    v[0x40] = mft_rec as u8;
+    v[0x44] = 1;
+    v[0x48..0x50].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+    v
+}
+
+#[test]
+fn decode_recognises_oem_id() {
+    let buf = fake_boot(512, 8, 4, -10);
+    let bs = boot::BootSector::decode(&buf).unwrap();
+    assert_eq!(bs.bytes_per_sector, 512);
+    assert_eq!(bs.sectors_per_cluster, 8);
+    assert_eq!(bs.mft_record_size(), 1024);
+    assert_eq!(bs.cluster_size(), 4096);
+}
+
+#[test]
+fn decode_handles_positive_clusters_per_mft_record() {
+    let buf = fake_boot(512, 8, 4, 2);
+    let bs = boot::BootSector::decode(&buf).unwrap();
+    assert_eq!(bs.mft_record_size(), 8192);
+}
+
+#[test]
+fn decode_rejects_negative_mft_record_shift_overflow() {
+    // clusters_per_mft_record = -127 would make `1 << 127` — must be rejected
+    // rather than panicking on shift overflow.
+    let buf = fake_boot(512, 8, 4, -127);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_negative_index_record_shift_overflow() {
+    let mut buf = fake_boot(512, 8, 4, -10);
+    buf[0x44] = (-127i8) as u8; // clusters_per_index_record
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_zero_bytes_per_sector() {
+    let buf = fake_boot(0, 8, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_non_power_of_two_bytes_per_sector() {
+    let buf = fake_boot(513, 8, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_oversized_bytes_per_sector() {
+    let buf = fake_boot(8192, 8, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_zero_sectors_per_cluster() {
+    let buf = fake_boot(512, 0, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_non_power_of_two_sectors_per_cluster() {
+    let buf = fake_boot(512, 3, 4, -10);
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_oversized_positive_mft_record() {
+    // clusters_per_mft_record = 127 with a 4 KiB cluster → ~508 KiB which is
+    // within range, but with sectors_per_cluster pushing cluster_size up the
+    // resulting record exceeds 1 MiB. Use a positive value that overflows the
+    // record-size cap: 127 clusters * 4096 = 520192 (< 1 MiB, accepted), so
+    // use a larger cluster to exceed it.
+    let buf = fake_boot(4096, 8, 4, 64); // cluster 32 KiB * 64 = 2 MiB record
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn decode_rejects_wrong_oem() {
+    let mut buf = fake_boot(512, 8, 4, -10);
+    buf[3..11].copy_from_slice(b"EXFAT   ");
+    assert!(boot::BootSector::decode(&buf).is_none());
+}
+
+#[test]
+fn probe_detects_ntfs() {
+    let mut dev = MemoryBackend::new(4096);
+    dev.write_at(0, &fake_boot(512, 8, 4, -10)).unwrap();
+    assert!(probe(&mut dev).unwrap());
+}
+
+#[test]
+fn fixup_roundtrip() {
+    // Build a 1024-byte record where bytes 510..512 and 1022..1024 are
+    // distinctive. install_fixup then apply_fixup must restore them.
+    let mut buf = vec![0u8; 1024];
+    buf[0..4].copy_from_slice(b"FILE");
+    buf[4..6].copy_from_slice(&42u16.to_le_bytes()); // usa_offset
+    buf[6..8].copy_from_slice(&3u16.to_le_bytes()); // usa_size (USN + 2 sectors)
+    buf[510] = 0xAA;
+    buf[511] = 0xBB;
+    buf[1022] = 0xCC;
+    buf[1023] = 0xDD;
+    mft::install_fixup(&mut buf, 512, 0x7777);
+    // The tails are now 0x77 0x77; originals are stashed in the USA.
+    assert_eq!(buf[510], 0x77);
+    assert_eq!(buf[511], 0x77);
+    mft::apply_fixup(&mut buf, 512).unwrap();
+    assert_eq!(buf[510], 0xAA);
+    assert_eq!(buf[511], 0xBB);
+    assert_eq!(buf[1022], 0xCC);
+    assert_eq!(buf[1023], 0xDD);
+}
+
+#[test]
+fn fixup_detects_torn_write() {
+    let mut buf = vec![0u8; 1024];
+    buf[0..4].copy_from_slice(b"FILE");
+    buf[4..6].copy_from_slice(&42u16.to_le_bytes());
+    buf[6..8].copy_from_slice(&3u16.to_le_bytes());
+    mft::install_fixup(&mut buf, 512, 0x7777);
+    // Corrupt the first sector's tail to simulate a torn write.
+    buf[511] = 0x00;
+    let err = mft::apply_fixup(&mut buf, 512).unwrap_err();
+    assert!(matches!(err, crate::Error::InvalidImage(_)));
+}
+
+// ---------------------------------------------------------------------
+// Minimal whole-volume fixture.
+//
+// Layout (cluster size = 4 KiB):
+//   LBA 0:    boot sector
+//   cluster 4 (offset 0x4000):  MFT starts here
+//     record 0:  $MFT itself, with one non-resident $DATA run covering
+//                clusters 4..6 (8 KiB of MFT).
+//     record 5:  root dir, with $INDEX_ROOT $I30 containing the entry
+//                for "hello.txt" + a tail entry, no $INDEX_ALLOCATION.
+//     record 6:  hello.txt with resident $DATA = b"hi\n" and a named
+//                $DATA "stream1" with b"AAAA".
+//
+// We write each record raw (no fixup) then call install_fixup to make
+// the USAs valid.
+// ---------------------------------------------------------------------
+
+fn build_attr_header(
+    type_code: u32,
+    total_length: u32,
+    non_resident: bool,
+    name_len_u16: u8,
+    name_off: u16,
+    flags: u16,
+    attr_id: u16,
+) -> Vec<u8> {
+    let mut h = vec![0u8; 16];
+    h[0..4].copy_from_slice(&type_code.to_le_bytes());
+    h[4..8].copy_from_slice(&total_length.to_le_bytes());
+    h[8] = non_resident as u8;
+    h[9] = name_len_u16;
+    h[10..12].copy_from_slice(&name_off.to_le_bytes());
+    h[12..14].copy_from_slice(&flags.to_le_bytes());
+    h[14..16].copy_from_slice(&attr_id.to_le_bytes());
+    h
+}
+
+/// Build a resident attribute (header + resident-specific fields + value).
+fn build_resident_attr(type_code: u32, name_utf16: &[u8], value: &[u8], attr_id: u16) -> Vec<u8> {
+    // Layout: 16 byte common header + 8 byte resident header + name (UTF16) + padding to 8 + value
+    let name_len_u16 = (name_utf16.len() / 2) as u8;
+    let name_off: u16 = if name_utf16.is_empty() { 0 } else { 0x18 };
+    let header_block_len = 0x18 + name_utf16.len();
+    let header_block_aligned = (header_block_len + 7) & !7;
+    let total = header_block_aligned + value.len();
+    let total = (total + 7) & !7;
+    let value_offset = header_block_aligned as u16;
+
+    let mut buf = Vec::with_capacity(total);
+    let mut hdr = build_attr_header(
+        type_code,
+        total as u32,
+        false,
+        name_len_u16,
+        name_off,
+        0,
+        attr_id,
+    );
+    // Resident-specific:
+    let mut resident = vec![0u8; 8];
+    resident[0..4].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    resident[4..6].copy_from_slice(&value_offset.to_le_bytes());
+    resident[6] = 0;
+    hdr.extend_from_slice(&resident);
+    buf.extend_from_slice(&hdr);
+    if !name_utf16.is_empty() {
+        buf.extend_from_slice(name_utf16);
+    }
+    while buf.len() < header_block_aligned {
+        buf.push(0);
+    }
+    buf.extend_from_slice(value);
+    while buf.len() < total {
+        buf.push(0);
+    }
+    buf
+}
+
+/// Build a non-resident attribute with the given mapping-pairs blob.
+#[allow(clippy::too_many_arguments)]
+fn build_non_resident_attr(
+    type_code: u32,
+    name_utf16: &[u8],
+    runs: &[u8],
+    starting_vcn: u64,
+    last_vcn: u64,
+    allocated: u64,
+    real: u64,
+    initialized: u64,
+    attr_id: u16,
+) -> Vec<u8> {
+    // Layout: 16 byte common header + 0x30 non-resident header bytes + name + runs
+    let name_len_u16 = (name_utf16.len() / 2) as u8;
+    let header_block_len = 0x40 + name_utf16.len();
+    let header_block_aligned = (header_block_len + 7) & !7;
+    let runs_off = header_block_aligned as u16;
+    let total = ((header_block_aligned + runs.len()) + 7) & !7;
+
+    let name_off: u16 = if name_utf16.is_empty() { 0 } else { 0x40 };
+    let mut hdr = build_attr_header(
+        type_code,
+        total as u32,
+        true,
+        name_len_u16,
+        name_off,
+        0,
+        attr_id,
+    );
+    let mut nonresident = vec![0u8; 0x30];
+    nonresident[0x00..0x08].copy_from_slice(&starting_vcn.to_le_bytes());
+    nonresident[0x08..0x10].copy_from_slice(&last_vcn.to_le_bytes());
+    nonresident[0x10..0x12].copy_from_slice(&runs_off.to_le_bytes());
+    nonresident[0x12..0x14].copy_from_slice(&0u16.to_le_bytes()); // compression unit
+    nonresident[0x18..0x20].copy_from_slice(&allocated.to_le_bytes());
+    nonresident[0x20..0x28].copy_from_slice(&real.to_le_bytes());
+    nonresident[0x28..0x30].copy_from_slice(&initialized.to_le_bytes());
+    hdr.extend_from_slice(&nonresident);
+    let mut buf = hdr;
+    if !name_utf16.is_empty() {
+        buf.extend_from_slice(name_utf16);
+    }
+    while buf.len() < header_block_aligned {
+        buf.push(0);
+    }
+    buf.extend_from_slice(runs);
+    while buf.len() < total {
+        buf.push(0);
+    }
+    buf
+}
+
+fn build_record(record_size: usize, flags: u16, attrs: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut rec = vec![0u8; record_size];
+    rec[0..4].copy_from_slice(b"FILE");
+    // usa_offset = 0x2A (42), usa_size depends on sectors covered.
+    rec[4..6].copy_from_slice(&0x2Au16.to_le_bytes());
+    let sectors = record_size / BPS as usize;
+    let usa_size = (sectors + 1) as u16;
+    rec[6..8].copy_from_slice(&usa_size.to_le_bytes());
+    // first_attr_offset = aligned past USA. USA occupies 0x2A..(0x2A + usa_size*2).
+    let usa_end = 0x2A + usa_size as usize * 2;
+    let first_attr_off = ((usa_end + 7) & !7) as u16; // align to 8
+    rec[0x14..0x16].copy_from_slice(&first_attr_off.to_le_bytes());
+    rec[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+
+    let mut cursor = first_attr_off as usize;
+    for a in &attrs {
+        rec[cursor..cursor + a.len()].copy_from_slice(a);
+        cursor += a.len();
+    }
+    // Terminator
+    let term = [0xFFu8, 0xFF, 0xFF, 0xFF];
+    rec[cursor..cursor + 4].copy_from_slice(&term);
+    cursor += 4;
+
+    let bytes_in_use = cursor as u32;
+    rec[0x18..0x1C].copy_from_slice(&bytes_in_use.to_le_bytes());
+    rec[0x1C..0x20].copy_from_slice(&(record_size as u32).to_le_bytes());
+
+    mft::install_fixup(&mut rec, BPS as usize, 0x0001);
+    rec
+}
+
+fn utf16_le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+/// Build a $FILE_NAME attribute value (just the payload, no header).
+fn build_file_name_value(
+    parent_ref: u64,
+    name: &str,
+    flags: u32,
+    real_size: u64,
+    namespace: u8,
+) -> Vec<u8> {
+    let name_utf16 = utf16_le(name);
+    let mut v = vec![0u8; 66 + name_utf16.len()];
+    v[0..8].copy_from_slice(&parent_ref.to_le_bytes());
+    // timestamps zero
+    v[40..48].copy_from_slice(&real_size.to_le_bytes());
+    v[48..56].copy_from_slice(&real_size.to_le_bytes());
+    v[56..60].copy_from_slice(&flags.to_le_bytes());
+    v[64] = (name_utf16.len() / 2) as u8;
+    v[65] = namespace;
+    v[66..].copy_from_slice(&name_utf16);
+    v
+}
+
+/// Build an $INDEX_ROOT value with `entries` as raw entry blobs.
+fn build_index_root_value(entries: &[Vec<u8>]) -> Vec<u8> {
+    // 16 bytes header (indexed type + collation + index block size + cpib + padding)
+    // 16 bytes index header
+    // entries
+    // The first 16 bytes:
+    let mut v: Vec<u8> = Vec::new();
+    v.extend_from_slice(&TYPE_FILE_NAME.to_le_bytes()); // indexed attr type
+    v.extend_from_slice(&1u32.to_le_bytes()); // collation = filename
+    v.extend_from_slice(&0u32.to_le_bytes()); // index block size (no allocation)
+    v.push(0); // cpib
+    v.extend_from_slice(&[0u8; 3]);
+
+    // Index header at offset 16.
+    let entries_total: usize = entries.iter().map(|e| e.len()).sum();
+    let first_entry_offset = 16u32; // entries start right after the 16-byte index header
+    let bytes_in_use = 16u32 + entries_total as u32;
+    let bytes_allocated = bytes_in_use;
+    let flags: u8 = 0; // SMALL_INDEX
+    v.extend_from_slice(&first_entry_offset.to_le_bytes());
+    v.extend_from_slice(&bytes_in_use.to_le_bytes());
+    v.extend_from_slice(&bytes_allocated.to_le_bytes());
+    v.push(flags);
+    v.extend_from_slice(&[0u8; 3]);
+    for e in entries {
+        v.extend_from_slice(e);
+    }
+    v
+}
+
+/// Build an index entry holding a $FILE_NAME key. `child_vcn` adds a
+/// child pointer (and the HAS_CHILD flag).
+fn build_index_entry(
+    file_ref: u64,
+    file_name_value: &[u8],
+    flags: u32,
+    child_vcn: Option<u64>,
+) -> Vec<u8> {
+    let key_len = file_name_value.len();
+    let mut payload_len = 16 + key_len;
+    payload_len = (payload_len + 7) & !7;
+    let entry_len = if child_vcn.is_some() {
+        payload_len + 8
+    } else {
+        payload_len
+    };
+    let mut e = vec![0u8; entry_len];
+    e[0..8].copy_from_slice(&file_ref.to_le_bytes());
+    e[8..10].copy_from_slice(&(entry_len as u16).to_le_bytes());
+    e[10..12].copy_from_slice(&(key_len as u16).to_le_bytes());
+    let final_flags = flags
+        | if child_vcn.is_some() {
+            index::ENTRY_FLAG_HAS_CHILD
+        } else {
+            0
+        };
+    e[12..16].copy_from_slice(&final_flags.to_le_bytes());
+    e[16..16 + key_len].copy_from_slice(file_name_value);
+    if let Some(vcn) = child_vcn {
+        let off = entry_len - 8;
+        e[off..off + 8].copy_from_slice(&vcn.to_le_bytes());
+    }
+    e
+}
+
+/// Build a terminator (last) entry. Empty key, with optional child.
+fn build_terminator_entry(child_vcn: Option<u64>) -> Vec<u8> {
+    let mut payload_len = 16;
+    let entry_len = if child_vcn.is_some() {
+        payload_len += 8;
+        payload_len
+    } else {
+        payload_len
+    };
+    let mut e = vec![0u8; entry_len];
+    e[0..8].copy_from_slice(&0u64.to_le_bytes()); // file_ref = 0
+    e[8..10].copy_from_slice(&(entry_len as u16).to_le_bytes());
+    e[10..12].copy_from_slice(&0u16.to_le_bytes()); // key_len = 0
+    let flags = index::ENTRY_FLAG_LAST
+        | if child_vcn.is_some() {
+            index::ENTRY_FLAG_HAS_CHILD
+        } else {
+            0
+        };
+    e[12..16].copy_from_slice(&flags.to_le_bytes());
+    if let Some(vcn) = child_vcn {
+        let off = entry_len - 8;
+        e[off..off + 8].copy_from_slice(&vcn.to_le_bytes());
+    }
+    e
+}
+
+/// Builds a tiny but complete-enough NTFS image for the integration
+/// tests. Returns (backend, mft byte offset).
+fn build_tiny_image() -> MemoryBackend {
+    let cluster_size = (BPS as u32) * (SPC as u32);
+    let mft_lcn = 4u64;
+    let mft_byte_off = mft_lcn * cluster_size as u64;
+
+    // Total: 32 clusters = 128 KiB. Layout:
+    //   cluster 4..6  : MFT (8 KiB == 8 records)
+    //   cluster 8..9  : root dir's $INDEX_ALLOCATION (none, we use small index)
+    //   cluster 10    : hello.txt's data... actually our $DATA is resident.
+    //   cluster 12    : "stream1" named $DATA for hello.txt — resident too.
+    let total_size = 32 * cluster_size as u64;
+    let mut dev = MemoryBackend::new(total_size);
+
+    // Boot sector
+    let mut boot = fake_boot(BPS, SPC, mft_lcn, -10);
+    dev.write_at(0, &boot[..]).unwrap();
+    // Boot sector must specify the index-block-size field too; -12 = 4 KiB
+    boot[0x44] = (-12i8) as u8;
+    dev.write_at(0x44, &[(-12i8) as u8]).unwrap();
+
+    // --- Record 0: $MFT ---
+    // $STANDARD_INFORMATION (resident)
+    let si_value = {
+        let mut v = vec![0u8; 48];
+        v[32..36].copy_from_slice(&0u32.to_le_bytes()); // attrs
+        v
+    };
+    let si_attr = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &si_value, 0);
+    // $FILE_NAME for $MFT (mostly cosmetic for record 0)
+    let mft_fname_value = build_file_name_value(
+        5,
+        "$MFT",
+        FileName::FLAG_DIRECTORY,
+        8 * REC_SIZE as u64,
+        FileName::NAMESPACE_WIN32,
+    );
+    let mft_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &mft_fname_value, 1);
+    // $DATA non-resident: one run, length=2 clusters, lcn=mft_lcn (4).
+    // Run list: 0x11 (1-byte length, 1-byte offset) + 0x02 + 0x04 + 0x00.
+    let mft_runs = vec![0x11u8, 0x02, 0x04, 0x00];
+    let mft_data = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &mft_runs,
+        0,
+        1,
+        2 * cluster_size as u64,
+        8 * REC_SIZE as u64,
+        8 * REC_SIZE as u64,
+        2,
+    );
+    let rec0 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), mft_fname_attr, mft_data],
+    );
+    dev.write_at(mft_byte_off, &rec0).unwrap();
+
+    // --- Record 5: root directory ---
+    let root_fname_value = build_file_name_value(
+        5,
+        ".",
+        FileName::FLAG_DIRECTORY,
+        0,
+        FileName::NAMESPACE_WIN32,
+    );
+    let root_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &root_fname_value, 1);
+
+    // Build $INDEX_ROOT pointing at "hello.txt" (file ref = record 6
+    // with sequence 1 in the high 16 bits).
+    let hello_ref: u64 = 6 | (1u64 << 48);
+    let hello_fn = build_file_name_value(5, "hello.txt", 0, 3, FileName::NAMESPACE_WIN32);
+    let hello_entry = build_index_entry(hello_ref, &hello_fn, 0, None);
+    let term_entry = build_terminator_entry(None);
+    let idx_root_value = build_index_root_value(&[hello_entry, term_entry]);
+    // Index root name = "$I30" (UTF-16LE).
+    let i30_name = utf16_le("$I30");
+    let idx_root_attr = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &idx_root_value, 2);
+    let rec5 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
+        vec![si_attr.clone(), root_fname_attr, idx_root_attr],
+    );
+    dev.write_at(mft_byte_off + 5 * REC_SIZE as u64, &rec5)
+        .unwrap();
+
+    // --- Record 6: hello.txt ---
+    let file_fname_value = build_file_name_value(5, "hello.txt", 0, 3, FileName::NAMESPACE_WIN32);
+    let file_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &file_fname_value, 1);
+    let file_data_attr = build_resident_attr(TYPE_DATA, &[], b"hi\n", 2);
+    let stream_name = utf16_le("stream1");
+    let stream_data_attr = build_resident_attr(TYPE_DATA, &stream_name, b"AAAA", 3);
+    let rec6 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr, file_fname_attr, file_data_attr, stream_data_attr],
+    );
+    dev.write_at(mft_byte_off + 6 * REC_SIZE as u64, &rec6)
+        .unwrap();
+
+    dev
+}
+
+#[test]
+fn read_mft_record_zero() {
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut buf = vec![0u8; REC_SIZE as usize];
+    ntfs.read_mft_record(&mut dev, 0, &mut buf).unwrap();
+    assert_eq!(&buf[0..4], b"FILE");
+    let hdr = mft::RecordHeader::parse(&buf).unwrap();
+    assert!(hdr.is_in_use());
+}
+
+#[test]
+fn list_root_directory() {
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs.list_path(&mut dev, "/").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "hello.txt");
+    assert_eq!(entries[0].kind, crate::fs::EntryKind::Regular);
+}
+
+#[test]
+fn read_hello_txt() {
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut reader = ntfs.open_file_reader(&mut dev, "/hello.txt").unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hi\n");
+}
+
+/// A seek past the end of a resident `$DATA` followed by a read must
+/// report EOF (0 bytes), not underflow `bytes.len() - pos`.
+#[test]
+fn resident_reader_read_after_seek_past_eof_is_eof() {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs.open_file_seekable(&mut dev, "/hello.txt").unwrap();
+    r.seek(SeekFrom::Start(100)).unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(r.read(&mut buf).unwrap(), 0);
+    // Seeking back inside the value still works afterwards.
+    r.seek(SeekFrom::Start(1)).unwrap();
+    assert_eq!(r.read(&mut buf).unwrap(), 2);
+    assert_eq!(&buf[..2], b"i\n");
+}
+
+#[test]
+fn read_xattrs_includes_dos_attrs_and_ads() {
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let attrs = ntfs.read_xattrs(&mut dev, "/hello.txt").unwrap();
+    assert!(attrs.contains_key(xattr_keys::DOS_ATTRS));
+    assert!(attrs.contains_key(xattr_keys::TIMES_RAW));
+    let ads_key = format!("{}stream1", xattr_keys::ADS_PREFIX);
+    assert_eq!(
+        attrs.get(&ads_key).map(|v| v.as_slice()),
+        Some(b"AAAA" as &[u8])
+    );
+}
+
+#[test]
+fn lookup_path_missing_component() {
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let err = ntfs.lookup_path(&mut dev, "/no_such_file").unwrap_err();
+    assert!(matches!(err, crate::Error::InvalidImage(_)));
+}
+
+// --- Case-insensitive lookup via $UpCase ----------------------------------
+//
+// The tiny image has no $UpCase metadata file, so the driver should fall
+// back to the identity table — lookups remain case-sensitive in that
+// degraded mode. We exercise the case-folding code path by installing an
+// ASCII-uppercasing UpCase directly into the cached field after open.
+
+#[test]
+fn case_insensitive_lookup_with_ascii_upcase() {
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    // Read record 0 first to bootstrap the MFT runs.
+    let mut scratch = vec![0u8; REC_SIZE as usize];
+    ntfs.read_mft_record(&mut dev, 0, &mut scratch).unwrap();
+
+    // Install an ASCII-uppercasing UpCase table directly.
+    let mut bytes = Vec::with_capacity(0x10000 * 2);
+    for i in 0..0x10000u32 {
+        let v = if (0x61..=0x7A).contains(&i) {
+            i as u16 - 0x20
+        } else {
+            i as u16
+        };
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    ntfs.upcase = Some(super::secure::UpcaseTable::from_bytes(&bytes));
+
+    // Now "/HELLO.TXT" should resolve to the same record as "/hello.txt".
+    let lower = ntfs.lookup_path(&mut dev, "/hello.txt").unwrap();
+    let upper = ntfs.lookup_path(&mut dev, "/HELLO.TXT").unwrap();
+    assert_eq!(lower, upper);
+}
+
+// --- $ATTRIBUTE_LIST spill ------------------------------------------------
+//
+// We fabricate a base record whose $DATA lives entirely in an extension
+// record, referenced through an $ATTRIBUTE_LIST. The full attribute view
+// is then assembled by `load_record_set` and `open_stream_by_record` must
+// find $DATA across records.
+
+#[test]
+fn data_attribute_from_extension_record() {
+    let cluster_size = (BPS as u32) * (SPC as u32);
+    let mft_lcn = 4u64;
+    let mft_byte_off = mft_lcn * cluster_size as u64;
+    let total_size = 32 * cluster_size as u64;
+    let mut dev = MemoryBackend::new(total_size);
+    // Boot
+    let boot = fake_boot(BPS, SPC, mft_lcn, -10);
+    dev.write_at(0, &boot[..]).unwrap();
+    dev.write_at(0x44, &[(-12i8) as u8]).unwrap();
+
+    let si_value = vec![0u8; 48];
+    let si_attr = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &si_value, 0);
+
+    // Record 0: $MFT
+    let mft_fname_value = build_file_name_value(
+        5,
+        "$MFT",
+        FileName::FLAG_DIRECTORY,
+        8 * REC_SIZE as u64,
+        FileName::NAMESPACE_WIN32,
+    );
+    let mft_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &mft_fname_value, 1);
+    let mft_runs = vec![0x11u8, 0x02, 0x04, 0x00];
+    let mft_data = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &mft_runs,
+        0,
+        1,
+        2 * cluster_size as u64,
+        8 * REC_SIZE as u64,
+        8 * REC_SIZE as u64,
+        2,
+    );
+    let rec0 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), mft_fname_attr, mft_data],
+    );
+    dev.write_at(mft_byte_off, &rec0).unwrap();
+
+    // Record 5: root directory pointing at "split.dat" (record 6).
+    let root_fname_value = build_file_name_value(
+        5,
+        ".",
+        FileName::FLAG_DIRECTORY,
+        0,
+        FileName::NAMESPACE_WIN32,
+    );
+    let root_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &root_fname_value, 1);
+    let split_ref: u64 = 6 | (1u64 << 48);
+    let split_fn = build_file_name_value(5, "split.dat", 0, 6, FileName::NAMESPACE_WIN32);
+    let split_entry = build_index_entry(split_ref, &split_fn, 0, None);
+    let term_entry = build_terminator_entry(None);
+    let idx_root_value = build_index_root_value(&[split_entry, term_entry]);
+    let i30_name = utf16_le("$I30");
+    let idx_root_attr = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &idx_root_value, 2);
+    let rec5 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
+        vec![si_attr.clone(), root_fname_attr, idx_root_attr],
+    );
+    dev.write_at(mft_byte_off + 5 * REC_SIZE as u64, &rec5)
+        .unwrap();
+
+    // Record 6: base record. Holds $SI + $FILE_NAME + $ATTRIBUTE_LIST.
+    // The $ATTRIBUTE_LIST points at record 7 for $DATA.
+    let file_fname_value = build_file_name_value(5, "split.dat", 0, 6, FileName::NAMESPACE_WIN32);
+    let file_fname_attr = build_resident_attr(TYPE_FILE_NAME, &[], &file_fname_value, 1);
+
+    // Build $ATTRIBUTE_LIST entry: one row pointing at record 7 for $DATA.
+    let mut alist_value: Vec<u8> = Vec::new();
+    let entry_len: u16 = 0x20;
+    alist_value.extend_from_slice(&TYPE_DATA.to_le_bytes()); // type
+    alist_value.extend_from_slice(&entry_len.to_le_bytes()); // entry_len
+    alist_value.push(0); // name_len
+    alist_value.push(0x1A); // name_off
+    alist_value.extend_from_slice(&0u64.to_le_bytes()); // starting_vcn
+    let rec7_ref: u64 = 7 | (1u64 << 48);
+    alist_value.extend_from_slice(&rec7_ref.to_le_bytes()); // mft ref to rec 7
+    alist_value.extend_from_slice(&3u16.to_le_bytes()); // attr id
+    while alist_value.len() < entry_len as usize {
+        alist_value.push(0);
+    }
+    let alist_attr = build_resident_attr(TYPE_ATTRIBUTE_LIST, &[], &alist_value, 2);
+
+    let rec6 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), file_fname_attr, alist_attr],
+    );
+    dev.write_at(mft_byte_off + 6 * REC_SIZE as u64, &rec6)
+        .unwrap();
+
+    // Record 7: extension record carrying the actual $DATA = b"hello!".
+    // base_record_ref points back at record 6 (low 48 bits) seq 1.
+    let data_attr = build_resident_attr(TYPE_DATA, &[], b"hello!", 3);
+    let mut rec7 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![data_attr],
+    );
+    // Patch base_record_ref at 0x20..0x28 to point at record 6.
+    let base_ref: u64 = 6 | (1u64 << 48);
+    rec7[0x20..0x28].copy_from_slice(&base_ref.to_le_bytes());
+    // Re-install fixup since we touched bytes after build_record installed it.
+    mft::install_fixup(&mut rec7, BPS as usize, 0x0001);
+    dev.write_at(mft_byte_off + 7 * REC_SIZE as u64, &rec7)
+        .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut reader = ntfs.open_file_reader(&mut dev, "/split.dat").unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello!");
+}
+
+// --- LZNT1 compressed $DATA ----------------------------------------------
+//
+// Build a synthetic CU of 4 clusters (16 KiB at 4 KiB clusters). The CU's
+// run list has 1 real cluster of LZNT1 data and 3 sparse clusters; the
+// decoder should produce 6 bytes of output ("ABCABC"), then zero-fill to
+// `real_size`.
+
+#[test]
+fn compressed_data_decodes_via_cu() {
+    let cluster_size = (BPS as u32) * (SPC as u32);
+    let mft_lcn = 4u64;
+    let mft_byte_off = mft_lcn * cluster_size as u64;
+    let total_size = 64 * cluster_size as u64;
+    let mut dev = MemoryBackend::new(total_size);
+    let boot = fake_boot(BPS, SPC, mft_lcn, -10);
+    dev.write_at(0, &boot[..]).unwrap();
+    dev.write_at(0x44, &[(-12i8) as u8]).unwrap();
+
+    // Build a compressed CU payload: one chunk → "ABCABC".
+    // (See compression::tests::decompresses_back_reference for the encoding.)
+    let chunk_payload = vec![0x08u8, b'A', b'B', b'C', 0x00, 0x20];
+    let chunk_len_minus_1 = chunk_payload.len() as u16 - 1;
+    let header = 0xB000u16 | chunk_len_minus_1;
+    let mut compressed = header.to_le_bytes().to_vec();
+    compressed.extend_from_slice(&chunk_payload);
+    // The driver expects one cluster of compressed data; pad to cluster.
+    while compressed.len() < cluster_size as usize {
+        compressed.push(0);
+    }
+    // Drop the data into cluster 20.
+    let data_lcn = 20u64;
+    dev.write_at(data_lcn * cluster_size as u64, &compressed)
+        .unwrap();
+
+    let si_value = vec![0u8; 48];
+    let si_attr = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &si_value, 0);
+
+    // Record 0: $MFT
+    let mft_fname_attr = build_resident_attr(
+        TYPE_FILE_NAME,
+        &[],
+        &build_file_name_value(
+            5,
+            "$MFT",
+            FileName::FLAG_DIRECTORY,
+            8 * REC_SIZE as u64,
+            FileName::NAMESPACE_WIN32,
+        ),
+        1,
+    );
+    let mft_runs = vec![0x11u8, 0x02, 0x04, 0x00];
+    let mft_data = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &mft_runs,
+        0,
+        1,
+        2 * cluster_size as u64,
+        8 * REC_SIZE as u64,
+        8 * REC_SIZE as u64,
+        2,
+    );
+    let rec0 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), mft_fname_attr, mft_data],
+    );
+    dev.write_at(mft_byte_off, &rec0).unwrap();
+
+    // Record 5: root dir indexing "lz.dat" → record 6.
+    let lz_ref: u64 = 6 | (1u64 << 48);
+    let lz_fn = build_file_name_value(5, "lz.dat", 0, 6, FileName::NAMESPACE_WIN32);
+    let lz_entry = build_index_entry(lz_ref, &lz_fn, 0, None);
+    let term = build_terminator_entry(None);
+    let idx_root_value = build_index_root_value(&[lz_entry, term]);
+    let i30_name = utf16_le("$I30");
+    let idx_root_attr = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &idx_root_value, 2);
+    let rec5 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(
+                    5,
+                    ".",
+                    FileName::FLAG_DIRECTORY,
+                    0,
+                    FileName::NAMESPACE_WIN32,
+                ),
+                1,
+            ),
+            idx_root_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 5 * REC_SIZE as u64, &rec5)
+        .unwrap();
+
+    // Record 6: lz.dat. Compressed $DATA, compression_unit=2 (1 << 2 = 4
+    // clusters per CU). Run list: 1 real cluster at LCN 20, then 3 sparse
+    // clusters. real_size = 6 (we only emit "ABCABC").
+    // Run encoding: 0x11 0x01 0x14 (len=1, offset=+20), 0x01 0x03 (len=3 sparse), 0x00.
+    let runs = vec![0x11u8, 0x01, 0x14, 0x01, 0x03, 0x00];
+    let mut data_attr = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &runs,
+        0,
+        3,
+        4 * cluster_size as u64,
+        6,
+        6,
+        3,
+    );
+    // Set compression flag + compression_unit=2 inside the header.
+    // Flags are at offset 12 of the attribute header.
+    data_attr[12..14].copy_from_slice(&ATTR_FLAG_COMPRESSED.to_le_bytes());
+    // compression_unit lives at attr_start + 0x22 (u16 low byte).
+    data_attr[0x22] = 2;
+    data_attr[0x23] = 0;
+    let rec6 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(5, "lz.dat", 0, 6, FileName::NAMESPACE_WIN32),
+                1,
+            ),
+            data_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 6 * REC_SIZE as u64, &rec6)
+        .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let mut reader = ntfs.open_file_reader(&mut dev, "/lz.dat").unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"ABCABC");
+}
+
+// --- Encrypted $DATA is rejected ----------------------------------------
+
+#[test]
+fn encrypted_data_is_unsupported() {
+    let cluster_size = (BPS as u32) * (SPC as u32);
+    let mft_lcn = 4u64;
+    let mft_byte_off = mft_lcn * cluster_size as u64;
+    let total_size = 32 * cluster_size as u64;
+    let mut dev = MemoryBackend::new(total_size);
+    let boot = fake_boot(BPS, SPC, mft_lcn, -10);
+    dev.write_at(0, &boot[..]).unwrap();
+    dev.write_at(0x44, &[(-12i8) as u8]).unwrap();
+
+    let si_value = vec![0u8; 48];
+    let si_attr = build_resident_attr(TYPE_STANDARD_INFORMATION, &[], &si_value, 0);
+
+    let mft_fname_attr = build_resident_attr(
+        TYPE_FILE_NAME,
+        &[],
+        &build_file_name_value(
+            5,
+            "$MFT",
+            FileName::FLAG_DIRECTORY,
+            8 * REC_SIZE as u64,
+            FileName::NAMESPACE_WIN32,
+        ),
+        1,
+    );
+    let mft_runs = vec![0x11u8, 0x02, 0x04, 0x00];
+    let mft_data = build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &mft_runs,
+        0,
+        1,
+        2 * cluster_size as u64,
+        8 * REC_SIZE as u64,
+        8 * REC_SIZE as u64,
+        2,
+    );
+    let rec0 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![si_attr.clone(), mft_fname_attr, mft_data],
+    );
+    dev.write_at(mft_byte_off, &rec0).unwrap();
+
+    let efs_ref: u64 = 6 | (1u64 << 48);
+    let efs_fn = build_file_name_value(5, "efs.dat", 0, 0, FileName::NAMESPACE_WIN32);
+    let efs_entry = build_index_entry(efs_ref, &efs_fn, 0, None);
+    let term = build_terminator_entry(None);
+    let idx_root_value = build_index_root_value(&[efs_entry, term]);
+    let i30_name = utf16_le("$I30");
+    let idx_root_attr = build_resident_attr(TYPE_INDEX_ROOT, &i30_name, &idx_root_value, 2);
+    let rec5 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE | mft::RecordHeader::FLAG_DIRECTORY,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(
+                    5,
+                    ".",
+                    FileName::FLAG_DIRECTORY,
+                    0,
+                    FileName::NAMESPACE_WIN32,
+                ),
+                1,
+            ),
+            idx_root_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 5 * REC_SIZE as u64, &rec5)
+        .unwrap();
+
+    // Record 6: efs.dat with ATTR_FLAG_ENCRYPTED set on $DATA.
+    let mut data_attr = build_resident_attr(TYPE_DATA, &[], b"AAAA", 3);
+    data_attr[12..14].copy_from_slice(&ATTR_FLAG_ENCRYPTED.to_le_bytes());
+    let rec6 = build_record(
+        REC_SIZE as usize,
+        mft::RecordHeader::FLAG_IN_USE,
+        vec![
+            si_attr.clone(),
+            build_resident_attr(
+                TYPE_FILE_NAME,
+                &[],
+                &build_file_name_value(5, "efs.dat", 0, 0, FileName::NAMESPACE_WIN32),
+                1,
+            ),
+            data_attr,
+        ],
+    );
+    dev.write_at(mft_byte_off + 6 * REC_SIZE as u64, &rec6)
+        .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let result = ntfs.open_file_reader(&mut dev, "/efs.dat");
+    match result {
+        Ok(_) => panic!("expected Unsupported error for EFS-encrypted file"),
+        Err(crate::Error::Unsupported(msg)) => assert!(msg.contains("EFS")),
+        Err(other) => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Writer tests.
+//
+// These format a fresh NTFS volume on an in-memory backend, exercise
+// create_*, then re-open the volume and verify the read path can walk
+// what was written.
+// ---------------------------------------------------------------------
+
+use super::format::FormatOpts;
+use crate::fs::{FileMeta, FileSource};
+
+fn fresh_volume(size: u64) -> (MemoryBackend, Ntfs) {
+    let mut dev = MemoryBackend::new(size);
+    let opts = FormatOpts {
+        volume_label: "fstool-test".to_string(),
+        ..Default::default()
+    };
+    let ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    (dev, ntfs)
+}
+
+#[test]
+fn writer_format_then_open_reads_boot_sector() {
+    let (mut dev, _ntfs) = fresh_volume(8 * 1024 * 1024);
+    // Re-open from device — verifies boot sector probe-able / decodable.
+    assert!(probe(&mut dev).unwrap());
+    let ntfs2 = Ntfs::open(&mut dev).unwrap();
+    assert_eq!(ntfs2.cluster_size(), 4096);
+    assert_eq!(ntfs2.mft_record_size(), 1024);
+}
+
+/// The USA fixup stride is 512 bytes on every NTFS volume, whatever the
+/// logical sector size — a 4 KiB-sector volume still protects each 512-byte
+/// block of its 1 KiB records (ntfs-3g `NTFS_BLOCK_SIZE`, ntfs3
+/// `SECTOR_SIZE`). Format with 4 KiB sectors, then make sure the record
+/// shape is right and a cold reopen can walk and mutate the volume.
+#[test]
+fn writer_format_with_4k_sectors_uses_512_byte_fixup_stride() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    let mut dev = MemoryBackend::new(16 * 1024 * 1024);
+    let opts = FormatOpts {
+        bytes_per_sector: 4096,
+        sectors_per_cluster: 1,
+        volume_label: "4K".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    assert_eq!(ntfs.bytes_per_sector(), 4096);
+    assert_eq!(ntfs.cluster_size(), 4096);
+    ntfs.create_dir(&mut dev, "/d", FileMeta::default())
+        .unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/d/f.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"four-k".to_vec())),
+            len: 6,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Record 0 on disk: 1024 / 512 + 1 = 3 USA entries, not 1024 / 4096 + 1.
+    let mft_off = ntfs.writer.as_ref().unwrap().mft_offset(0).unwrap();
+    let mut raw = vec![0u8; 1024];
+    dev.read_at(mft_off, &mut raw).unwrap();
+    assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 3, "usa_size");
+    mft::apply_fixup(&mut raw, mft::NTFS_BLOCK_SIZE).unwrap();
+
+    // Cold reopen: read path (records + INDX blocks) and the write path
+    // (writer reconstruction, journal, record rewrite) must all agree on
+    // the stride.
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let names: Vec<String> = ro
+        .list_path(&mut dev, "/d")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["f.txt".to_string()]);
+    let mut r = ro.open_file_reader(&mut dev, "/d/f.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"four-k");
+    drop(r);
+    {
+        let mut h = ro
+            .open_file_rw(&mut dev, Path::new("/d/f.txt"), OpenFlags::default(), None)
+            .unwrap();
+        h.seek(SeekFrom::End(0)).unwrap();
+        h.write_all(b"!").unwrap();
+        h.sync().unwrap();
+    }
+    let mut again = Ntfs::open(&mut dev).unwrap();
+    let mut r = again.open_file_reader(&mut dev, "/d/f.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"four-k!");
+}
+
+/// The cluster count comes from the BPB (`total_sectors / spc`), not the
+/// device size: the BPB excludes the last sector (backup boot sector), so
+/// the cluster overlapping it must never be allocatable — and a reopened
+/// volume must size its bitmap the same way the formatter did.
+#[test]
+fn cluster_count_follows_bpb_not_device_size() {
+    let size = 8 * 1024 * 1024u64;
+    let (mut dev, mut ntfs) = fresh_volume(size);
+    let sectors = size / 512;
+    assert_eq!(ntfs.boot_sector().total_sectors, sectors - 1);
+    let expect_clusters = (sectors - 1) / 8;
+    assert_eq!(expect_clusters, 2047);
+    {
+        let w = ntfs.writer.as_ref().unwrap();
+        assert_eq!(w.layout.total_clusters, expect_clusters);
+        assert_eq!(w.layout.bitmap.total, expect_clusters);
+        // Cluster 2047 (the one holding the backup boot sector) is
+        // outside the volume: the allocator reports it as unavailable.
+        assert!(w.layout.bitmap.is_set(2047));
+    }
+    ntfs.flush(&mut dev).unwrap();
+    // The backup boot sector sits in the BPB's last sector.
+    let mut primary = vec![0u8; 512];
+    let mut backup = vec![0u8; 512];
+    dev.read_at(0, &mut primary).unwrap();
+    dev.read_at((sectors - 1) * 512, &mut backup).unwrap();
+    assert_eq!(primary, backup);
+
+    // Reopen on a *larger* device: the reconstructed writer must still
+    // size everything from the BPB.
+    let mut big = MemoryBackend::new(size * 2);
+    big.write_at(0, dev.as_slice()).unwrap();
+    let mut ro = Ntfs::open(&mut big).unwrap();
+    ro.create_file(
+        &mut big,
+        "/x",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+            len: 1,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    let w = ro.writer.as_ref().unwrap();
+    assert_eq!(w.layout.total_clusters, expect_clusters);
+    assert_eq!(w.layout.bitmap.total, expect_clusters);
+}
+
+#[test]
+fn writer_format_volume_has_root_directory() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    let entries = ntfs.list_path(&mut dev, "/").unwrap();
+    // Freshly formatted root should be empty.
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn writer_creates_small_file_resident_data() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/hello.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Re-open and read.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(entries.iter().any(|e| e.name == "hello.txt"));
+    let mut r = ntfs2.open_file_reader(&mut dev, "/hello.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hi\n");
+}
+
+#[test]
+fn writer_creates_large_file_non_resident_data() {
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    // 8000 bytes is larger than the resident budget and forces a
+    // non-resident $DATA with a single cluster run.
+    let payload: Vec<u8> = (0..8000).map(|i| (i & 0xFF) as u8).collect();
+    ntfs.create_file(
+        &mut dev,
+        "/big.bin",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.clone())),
+            len: payload.len() as u64,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs2.open_file_reader(&mut dev, "/big.bin").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, payload);
+}
+
+#[test]
+fn writer_creates_directory() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_dir(&mut dev, "/sub", FileMeta::default())
+        .unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/sub/note.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+            len: 1,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let root_entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(root_entries.iter().any(|e| e.name == "sub"));
+    let sub_entries = ntfs2.list_path(&mut dev, "/sub").unwrap();
+    assert!(sub_entries.iter().any(|e| e.name == "note.txt"));
+}
+
+#[test]
+fn writer_creates_symlink() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_symlink(&mut dev, "/link", "target.txt", FileMeta::default())
+        .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(entries.iter().any(|e| e.name == "link"));
+    // Reparse data should be present on the entry.
+    let xattrs = ntfs2.read_xattrs(&mut dev, "/link").unwrap();
+    assert!(xattrs.contains_key(xattr_keys::REPARSE));
+}
+
+#[test]
+fn writer_accepts_char_block_devices_via_intx() {
+    // Char and block devices are encoded as 24-byte INTX_FILE payloads
+    // in $DATA (magic + 8B major LE + 8B minor LE), matching ntfs-3g's
+    // `INTX_FILE_TYPES` vocabulary. The lib test confirms the on-disk
+    // payload byte-for-byte; the external test in tests/ntfs_external.rs
+    // additionally cross-validates via `ntfscat` + `ntfsfix`.
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_device(
+        &mut dev,
+        "/null",
+        crate::fs::DeviceKind::Char,
+        1,
+        3,
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.create_device(
+        &mut dev,
+        "/loop0",
+        crate::fs::DeviceKind::Block,
+        7,
+        0,
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Read back the $DATA byte-for-byte through fstool's own reader.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs2.open_file_reader(&mut dev, "/null").unwrap();
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+    assert_eq!(got.len(), 24);
+    assert_eq!(&got[..8], b"IntxCHR\0");
+    assert_eq!(u64::from_le_bytes(got[8..16].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(got[16..24].try_into().unwrap()), 3);
+    drop(r);
+
+    let mut r = ntfs2.open_file_reader(&mut dev, "/loop0").unwrap();
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+    assert_eq!(&got[..8], b"IntxBLK\0");
+    assert_eq!(u64::from_le_bytes(got[8..16].try_into().unwrap()), 7);
+    assert_eq!(u64::from_le_bytes(got[16..24].try_into().unwrap()), 0);
+}
+
+#[test]
+fn writer_refuses_fifo_and_socket() {
+    // FIFOs and sockets have no INTX_FILE magic in ntfs-3g's
+    // vocabulary, so the writer rejects them up front with
+    // Unsupported — better than silently producing a file ntfs-3g
+    // cannot identify as a special node.
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    for kind in [crate::fs::DeviceKind::Fifo, crate::fs::DeviceKind::Socket] {
+        let err = ntfs
+            .create_device(&mut dev, "/x", kind, 0, 0, FileMeta::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "expected Unsupported for {kind:?}, got: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn writer_create_without_format_errors() {
+    // Open an existing read-only image (the tiny one) and try to create.
+    let mut dev = build_tiny_image();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let err = ntfs
+        .create_file(
+            &mut dev,
+            "/new.txt",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::Unsupported(_)));
+}
+
+#[test]
+fn writer_dir_promotes_to_index_allocation() {
+    // Add enough entries to a directory that the $INDEX_ROOT overflows
+    // its 512-byte budget and gets promoted to $INDEX_ALLOCATION.
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    for i in 0..16 {
+        let path = format!("/file_{i:02}.txt");
+        ntfs.create_file(
+            &mut dev,
+            &path,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    let names: std::collections::HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
+    for i in 0..16 {
+        assert!(
+            names.contains(&format!("file_{i:02}.txt")),
+            "missing file_{i:02}.txt"
+        );
+    }
+}
+
+/// Byte size of a directory's `$INDEX_ALLOCATION:$I30` (0 when the index
+/// is still root-resident) and its `$INDEX_ROOT`'s `index_block_size`.
+fn index_allocation_shape(ntfs: &mut Ntfs, dev: &mut MemoryBackend, path: &str) -> (u64, u32) {
+    let rec = ntfs.lookup_path(dev, path).unwrap();
+    let records = ntfs.load_record_set(dev, rec).unwrap();
+    let mut alloc = 0u64;
+    let mut block = 0u32;
+    for (_, buf) in &records {
+        let h = mft::RecordHeader::parse(buf).unwrap();
+        for attr in AttributeIter::new(buf, h.first_attribute_offset as usize) {
+            let attr = attr.unwrap();
+            if attr.name != "$I30" {
+                continue;
+            }
+            match (attr.type_code, attr.kind) {
+                (TYPE_INDEX_ALLOCATION, AttributeKind::NonResident { real_size, .. }) => {
+                    alloc = real_size;
+                }
+                (TYPE_INDEX_ROOT, AttributeKind::Resident { value, .. }) => {
+                    block = index::IndexRootHeader::parse(value)
+                        .unwrap()
+                        .index_block_size;
+                }
+                _ => {}
+            }
+        }
+    }
+    (alloc, block)
+}
+
+/// Sorted names under `path` from a cold reopen of `dev`.
+fn names_after_reopen(dev: &mut MemoryBackend, path: &str) -> Vec<String> {
+    let mut ro = Ntfs::open(dev).unwrap();
+    let mut v: Vec<String> = ro
+        .list_path(dev, path)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Inserts and removes on a directory whose `$I30` spans several INDX
+/// blocks (a real B-tree with an internal root). The old writer treated
+/// VCN 0 — the leftmost *leaf* — as "the" block: later batches were
+/// appended to that leaf and re-serialised without its siblings' parent
+/// pointers, orphaning most of the directory. Every batch now rebuilds
+/// the tree from all reachable entries. Exercised at three cluster sizes
+/// so the VCN unit (cluster, or 512 bytes when the cluster is larger
+/// than an index block — `vcn_unit_bytes`) is covered on both sides.
+#[test]
+fn multi_block_index_survives_batched_inserts_and_removes() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    for spc in [2u8, 8, 16] {
+        let mut dev = MemoryBackend::new(32 * 1024 * 1024);
+        let opts = FormatOpts {
+            sectors_per_cluster: spc,
+            volume_label: "BTREE".into(),
+            ..Default::default()
+        };
+        let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+        ntfs.create_dir(&mut dev, "/big", FileMeta::default())
+            .unwrap();
+        let mk = |ntfs: &mut Ntfs, dev: &mut MemoryBackend, i: usize| {
+            ntfs.create_file(
+                dev,
+                &format!("/big/entry_number_{i:04}.dat"),
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(vec![b'x'; 3])),
+                    len: 3,
+                },
+                FileMeta::default(),
+            )
+            .unwrap();
+        };
+        // Batch 1: enough entries for several leaves (≈ 38 per 4 KiB block).
+        for i in 0..200 {
+            mk(&mut ntfs, &mut dev, i);
+        }
+        ntfs.flush(&mut dev).unwrap();
+        let (alloc, block) = index_allocation_shape(&mut ntfs, &mut dev, "/big");
+        assert!(
+            alloc > block as u64 * 2,
+            "spc={spc}: expected a multi-block tree, got alloc={alloc} block={block}"
+        );
+        // Batch 2 lands in an already-promoted, multi-block directory.
+        for i in 200..260 {
+            mk(&mut ntfs, &mut dev, i);
+        }
+        ntfs.flush(&mut dev).unwrap();
+        let mut expect: Vec<String> = (0..260)
+            .map(|i| format!("entry_number_{i:04}.dat"))
+            .collect();
+        expect.sort();
+        assert_eq!(
+            names_after_reopen(&mut dev, "/big"),
+            expect,
+            "spc={spc} after inserts"
+        );
+
+        // Remove entries from what were different leaves.
+        for i in [0usize, 77, 150, 259] {
+            ntfs.remove(&mut dev, &format!("/big/entry_number_{i:04}.dat"))
+                .unwrap();
+        }
+        ntfs.flush(&mut dev).unwrap();
+        expect.retain(|n| {
+            ![0usize, 77, 150, 259]
+                .iter()
+                .any(|i| *n == format!("entry_number_{i:04}.dat"))
+        });
+        assert_eq!(
+            names_after_reopen(&mut dev, "/big"),
+            expect,
+            "spc={spc} after removes"
+        );
+
+        // Path lookups (which descend the tree) still resolve, and a
+        // size change made through open_file_rw is patched into
+        // whichever block holds the entry.
+        let mut ro = Ntfs::open(&mut dev).unwrap();
+        // Removed above: must not resolve any more.
+        assert!(
+            ro.open_file_rw(
+                &mut dev,
+                Path::new("/big/entry_number_0150.dat"),
+                OpenFlags::default(),
+                None,
+            )
+            .is_err()
+        );
+        {
+            let mut h = ro
+                .open_file_rw(
+                    &mut dev,
+                    Path::new("/big/entry_number_0151.dat"),
+                    OpenFlags::default(),
+                    None,
+                )
+                .unwrap();
+            h.seek(SeekFrom::End(0)).unwrap();
+            h.write_all(&vec![b'y'; 5000]).unwrap();
+            h.sync().unwrap();
+        }
+        let mut again = Ntfs::open(&mut dev).unwrap();
+        let a = again
+            .getattr(&mut dev, Path::new("/big/entry_number_0151.dat"))
+            .unwrap();
+        assert_eq!(a.size, 5003, "spc={spc}: index entry size after rw extend");
+        let mut r = again
+            .open_file_reader(&mut dev, "/big/entry_number_0151.dat")
+            .unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), 5003);
+        assert_eq!(&buf[..3], b"xxx");
+    }
+}
+
+/// Extending a file through `open_file_rw` must update the size stored in
+/// the parent's `$I30` entry — that is what `list` / `getattr` report.
+/// For a small (root-resident) directory the patch used to start at the
+/// index header instead of the first entry and never landed.
+#[test]
+fn rw_extend_updates_size_in_root_resident_index() {
+    use crate::fs::{Filesystem, OpenFlags};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs_create_small(&mut ntfs, &mut dev, "/d", "/d/grow.txt");
+    ntfs.flush(&mut dev).unwrap();
+    let (alloc, _) = index_allocation_shape(&mut ntfs, &mut dev, "/d");
+    assert_eq!(alloc, 0, "directory must still be root-resident");
+
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    {
+        let mut h = ro
+            .open_file_rw(
+                &mut dev,
+                Path::new("/d/grow.txt"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        h.seek(SeekFrom::End(0)).unwrap();
+        h.write_all(&vec![0u8; 9000]).unwrap();
+        h.sync().unwrap();
+    }
+    let listed = ro
+        .list_path(&mut dev, "/d")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "grow.txt")
+        .unwrap();
+    assert_eq!(listed.size, 9002);
+    let mut again = Ntfs::open(&mut dev).unwrap();
+    let a = again.getattr(&mut dev, Path::new("/d/grow.txt")).unwrap();
+    assert_eq!(a.size, 9002);
+}
+
+/// On-disk `$I30` order follows `$UpCase` collation, so ntfs-3g's binary
+/// search finds non-ASCII names. `é` folds to `É` (U+00C9) and so lands
+/// before `Ê` (U+00CA), even though its raw code unit (U+00E9) is the
+/// larger of the two; folded ASCII (`E`, `F`) still sorts ahead of both.
+/// `list_path` returns entries in on-disk order.
+#[test]
+fn writer_sorts_non_ascii_names_by_upcase_collation() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_dir(&mut dev, "/u", FileMeta::default())
+        .unwrap();
+    for name in ["Ê.txt", "é.txt", "f.txt", "E.txt"] {
+        ntfs.create_file(
+            &mut dev,
+            &format!("/u/{name}"),
+            FileSource::Zero(0),
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let order: Vec<String> = ro
+        .list_path(&mut dev, "/u")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(order, ["E.txt", "f.txt", "é.txt", "Ê.txt"]);
+    // Case-insensitive lookup through the on-disk `$UpCase` still works.
+    assert!(ro.lookup_path(&mut dev, "/u/É.TXT").is_ok());
+}
+
+/// The writer grows `$MFT` past its initial 64 records; the read path on
+/// the *same* handle (lookups, remove, getattr) must follow that growth
+/// instead of serving the run list it cached from record 0 at open.
+#[test]
+fn reader_follows_mft_growth_on_live_handle() {
+    use crate::fs::Filesystem;
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(32 * 1024 * 1024);
+    let initial_records = ntfs.writer.as_ref().unwrap().layout.mft_records;
+    let n = initial_records as usize + 20;
+    for i in 0..n {
+        ntfs.create_file(
+            &mut dev,
+            &format!("/f{i}"),
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(vec![b'.'; 1])),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    assert!(ntfs.writer.as_ref().unwrap().layout.mft_records > initial_records);
+    let last = format!("/f{}", n - 1);
+    let rec = ntfs.lookup_path(&mut dev, &last).unwrap();
+    assert!(
+        rec >= initial_records,
+        "record {rec} should sit in the grown region"
+    );
+    assert_eq!(ntfs.getattr(&mut dev, Path::new(&last)).unwrap().size, 1);
+    ntfs.remove(&mut dev, &last).unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    assert!(!names_after_reopen(&mut dev, "/").contains(&format!("f{}", n - 1)));
+}
+
+fn ntfs_create_small(ntfs: &mut Ntfs, dev: &mut MemoryBackend, dir: &str, file: &str) {
+    ntfs.create_dir(dev, dir, FileMeta::default()).unwrap();
+    ntfs.create_file(
+        dev,
+        file,
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi".to_vec())),
+            len: 2,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn writer_streams_large_file_through_scratch_buffer() {
+    // 200 KiB file forces multiple scratch buffers worth of streaming.
+    let (mut dev, mut ntfs) = fresh_volume(64 * 1024 * 1024);
+    let size = 200 * 1024;
+    let payload: Vec<u8> = (0..size).map(|i| ((i * 7) & 0xFF) as u8).collect();
+    ntfs.create_file(
+        &mut dev,
+        "/stream.bin",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(payload.clone())),
+            len: payload.len() as u64,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut r = ntfs2.open_file_reader(&mut dev, "/stream.bin").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), payload.len());
+    assert_eq!(buf, payload);
+}
+
+#[test]
+fn writer_zero_length_file() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/empty.txt",
+        FileSource::Zero(0),
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/").unwrap();
+    assert!(entries.iter().any(|e| e.name == "empty.txt"));
+    let mut r = ntfs2.open_file_reader(&mut dev, "/empty.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, Vec::<u8>::new());
+}
+
+#[test]
+fn writer_nested_directories() {
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    ntfs.create_dir(&mut dev, "/a", FileMeta::default())
+        .unwrap();
+    ntfs.create_dir(&mut dev, "/a/b", FileMeta::default())
+        .unwrap();
+    ntfs.create_dir(&mut dev, "/a/b/c", FileMeta::default())
+        .unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/a/b/c/deep.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"deep!".to_vec())),
+            len: 5,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let entries = ntfs2.list_path(&mut dev, "/a/b/c").unwrap();
+    assert!(entries.iter().any(|e| e.name == "deep.txt"));
+    let mut r = ntfs2.open_file_reader(&mut dev, "/a/b/c/deep.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"deep!");
+}
+
+#[test]
+fn writer_format_emits_upcase_table() {
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    // After format, $UpCase record 10 should exist and have a non-trivial
+    // $DATA stream that round-trips through the reader.
+    let mut buf = vec![0u8; ntfs.mft_record_size() as usize];
+    ntfs.read_mft_record(&mut dev, MFT_RECORD_UPCASE, &mut buf)
+        .unwrap();
+    let hdr = mft::RecordHeader::parse(&buf).unwrap();
+    assert!(hdr.is_in_use());
+}
+
+#[test]
+fn writer_root_index_contains_system_files() {
+    // `format()` populates the root's `$I30` with index entries for every
+    // canonical system MFT record (0..=15 minus the root itself). The
+    // cross-FS view filters `$`-names out of `list_path("/")`, but the
+    // on-disk index does carry them — verifies the layout that ntfs-3g
+    // expects.
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    ntfs.flush(&mut dev).unwrap();
+
+    // Re-open and inspect the raw root directory entries.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let raw = ntfs2.read_directory(&mut dev, MFT_RECORD_ROOT).unwrap();
+    let names: std::collections::HashSet<String> = raw
+        .iter()
+        .filter_map(|e| e.file_name.as_ref().map(|f| f.name.clone()))
+        .collect();
+
+    // Every canonical NTFS system file should be indexed in the root.
+    for expected in &[
+        "$MFT", "$MFTMirr", "$LogFile", "$Volume", "$AttrDef", "$Bitmap", "$Boot", "$BadClus",
+        "$Secure", "$UpCase", "$Extend",
+    ] {
+        assert!(
+            names.contains(*expected),
+            "expected root $I30 to index {expected:?}, got {:?}",
+            names
+        );
+    }
+    // The root must NOT index itself.
+    assert!(
+        !raw.iter()
+            .any(|e| (e.file_ref & 0x0000_FFFF_FFFF_FFFF) == MFT_RECORD_ROOT),
+        "root must not self-reference in its own $I30"
+    );
+
+    // The cross-FS `list_path("/")` must hide these system files so the
+    // generic walker keeps seeing a clean user-facing view.
+    let user_view = ntfs2.list_path(&mut dev, "/").unwrap();
+    for entry in &user_view {
+        assert!(
+            !entry.name.starts_with('$'),
+            "list_path(\"/\") leaked system file {:?}",
+            entry.name
+        );
+    }
+}
+
+#[test]
+fn writer_root_index_keeps_system_files_after_user_files_added() {
+    // Add several user files to force an $INDEX_ROOT → $INDEX_ALLOCATION
+    // promotion. The system-file entries planted by `format()` must
+    // survive promotion and remain visible in the root's index.
+    let (mut dev, mut ntfs) = fresh_volume(16 * 1024 * 1024);
+    for i in 0..10 {
+        let path = format!("/u_{i}.txt");
+        ntfs.create_file(
+            &mut dev,
+            &path,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(b"x".to_vec())),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let raw = ntfs2.read_directory(&mut dev, MFT_RECORD_ROOT).unwrap();
+    let names: std::collections::HashSet<String> = raw
+        .iter()
+        .filter_map(|e| e.file_name.as_ref().map(|f| f.name.clone()))
+        .collect();
+    for expected in &["$MFT", "$Volume", "$Bitmap", "$UpCase", "$Extend"] {
+        assert!(
+            names.contains(*expected),
+            "post-promotion root $I30 missing {expected:?}"
+        );
+    }
+    for i in 0..10 {
+        let want = format!("u_{i}.txt");
+        assert!(names.contains(&want), "user file {want:?} missing");
+    }
+}
+
+#[test]
+fn open_file_ro_random_seek_ntfs() {
+    use crate::fs::Filesystem;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    // Large enough that the $DATA goes non-resident (one cluster is 4 KiB).
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i & 0xFF) as u8).collect();
+    ntfs.create_file(
+        &mut dev,
+        "/ro.bin",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(data.clone())),
+            len: data.len() as u64,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Reopen — the read-only path doesn't need writer state.
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+    let mut h = ntfs2
+        .open_file_ro(&mut dev, std::path::Path::new("/ro.bin"))
+        .expect("open_file_ro");
+    assert_eq!(h.len(), data.len() as u64);
+    assert!(!h.is_empty());
+
+    h.seek(SeekFrom::Start(9000)).unwrap();
+    let mut buf = [0u8; 256];
+    h.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf[..], &data[9000..9256]);
+
+    h.seek(SeekFrom::Start(50)).unwrap();
+    let mut buf2 = [0u8; 100];
+    h.read_exact(&mut buf2).unwrap();
+    assert_eq!(&buf2[..], &data[50..150]);
+}
+
+/// Helper: extract the `security_id` from `$STANDARD_INFORMATION` of an
+/// MFT record. Returns `0` when the SI value isn't long enough to carry
+/// the NTFS 3.0+ extension (i.e. the file was stamped with the legacy
+/// 48-byte form).
+fn read_security_id_for_record(ntfs: &mut Ntfs, dev: &mut MemoryBackend, rec_no: u64) -> u32 {
+    let mut buf = vec![0u8; ntfs.mft_record_size() as usize];
+    ntfs.read_mft_record(dev, rec_no, &mut buf).unwrap();
+    let hdr = mft::RecordHeader::parse(&buf).unwrap();
+    for attr_res in AttributeIter::new(&buf, hdr.first_attribute_offset as usize) {
+        let attr = attr_res.unwrap();
+        if attr.type_code != TYPE_STANDARD_INFORMATION {
+            continue;
+        }
+        if let AttributeKind::Resident { value, .. } = attr.kind {
+            if value.len() >= 0x38 {
+                return u32::from_le_bytes(value[0x34..0x38].try_into().unwrap());
+            }
+            return 0;
+        }
+    }
+    panic!("record {rec_no} has no resident $STANDARD_INFORMATION");
+}
+
+#[test]
+fn writer_format_emits_multiple_security_descriptors() {
+    // Multi-SD verification:
+    //   * Format a fresh image.
+    //   * Add at least one user file.
+    //   * On reopen, $Secure:$SDS must carry >= 2 distinct (hash, security_id)
+    //     pairs (User vs. System).
+    //   * System records (e.g. $MFT at record 0) must have SI.security_id
+    //     pointing at the System SD (FIRST_SECURITY_ID + 1).
+    //   * User-visible files / directories (the root, and /u.txt) must
+    //     have SI.security_id pointing at the User SD (FIRST_SECURITY_ID).
+    use super::format::{FIRST_SECURITY_ID, security_id_for};
+    use super::secure::SecurityClass;
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/u.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    let mut ntfs2 = Ntfs::open(&mut dev).unwrap();
+
+    // Pull the entire $SDS stream and scan its SDS-entry headers (20 bytes
+    // each, padded to a 16-byte boundary). We expect at least two distinct
+    // entries with different (hash, security_id) pairs — one User, one
+    // System.
+    let mut sds = Vec::new();
+    {
+        let mut r = ntfs2
+            .open_stream_by_record(&mut dev, MFT_RECORD_SECURE, "$SDS")
+            .unwrap();
+        r.read_to_end(&mut sds).unwrap();
+    }
+
+    let mut entries: Vec<(u32, u32, u32)> = Vec::new(); // (hash, security_id, size)
+    let mut off = 0usize;
+    while off + 0x14 <= sds.len() {
+        let hash = u32::from_le_bytes(sds[off..off + 4].try_into().unwrap());
+        let sid = u32::from_le_bytes(sds[off + 4..off + 8].try_into().unwrap());
+        let _entry_off = u64::from_le_bytes(sds[off + 8..off + 16].try_into().unwrap());
+        let size = u32::from_le_bytes(sds[off + 16..off + 20].try_into().unwrap());
+        if size == 0 || (size as usize) < 0x14 {
+            break;
+        }
+        if sid == 0 {
+            // Padding region or trailing zeros — end of stream.
+            break;
+        }
+        entries.push((hash, sid, size));
+        // Advance by `size` and pad to 16-byte boundary.
+        let advance = ((size as usize) + 0x0F) & !0x0F;
+        off += advance;
+    }
+
+    assert!(
+        entries.len() >= 2,
+        "expected >= 2 SDS entries, got {}: {:?}",
+        entries.len(),
+        entries
+    );
+
+    // Collect distinct (hash, security_id) pairs and assert >= 2.
+    use std::collections::HashSet;
+    let distinct: HashSet<(u32, u32)> = entries.iter().map(|&(h, s, _)| (h, s)).collect();
+    assert!(
+        distinct.len() >= 2,
+        "expected >= 2 distinct (hash, security_id) pairs in $SDS, got {distinct:?}"
+    );
+
+    // The two ids we currently emit are User (0x100) and System (0x101).
+    let user_id = security_id_for(SecurityClass::User);
+    let system_id = security_id_for(SecurityClass::System);
+    assert_eq!(user_id, FIRST_SECURITY_ID);
+    assert_eq!(system_id, FIRST_SECURITY_ID + 1);
+    let ids: HashSet<u32> = entries.iter().map(|&(_, s, _)| s).collect();
+    assert!(
+        ids.contains(&user_id),
+        "expected User security_id {user_id:#x} in $SDS, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&system_id),
+        "expected System security_id {system_id:#x} in $SDS, got {ids:?}"
+    );
+
+    // The two distinct ids must hash to different values — otherwise the
+    // catalogue collapsed back to a single descriptor.
+    let user_hash = entries
+        .iter()
+        .find(|(_, s, _)| *s == user_id)
+        .map(|(h, _, _)| *h)
+        .unwrap();
+    let system_hash = entries
+        .iter()
+        .find(|(_, s, _)| *s == system_id)
+        .map(|(h, _, _)| *h)
+        .unwrap();
+    assert_ne!(
+        user_hash, system_hash,
+        "User and System SDs unexpectedly share a hash — catalogue collapsed?"
+    );
+
+    // System records must point at the System SD.
+    let mft_sid = read_security_id_for_record(&mut ntfs2, &mut dev, MFT_RECORD_MFT);
+    assert_eq!(
+        mft_sid, system_id,
+        "$MFT (record 0) should carry System security_id"
+    );
+    let secure_sid = read_security_id_for_record(&mut ntfs2, &mut dev, MFT_RECORD_SECURE);
+    assert_eq!(
+        secure_sid, system_id,
+        "$Secure (record 9) should carry System security_id"
+    );
+
+    // Root and the user file must point at the User SD.
+    let root_sid = read_security_id_for_record(&mut ntfs2, &mut dev, MFT_RECORD_ROOT);
+    assert_eq!(
+        root_sid, user_id,
+        "root directory should carry User security_id"
+    );
+    let user_rec = ntfs2.lookup_path(&mut dev, "/u.txt").unwrap();
+    let user_sid = read_security_id_for_record(&mut ntfs2, &mut dev, user_rec);
+    assert_eq!(user_sid, user_id, "/u.txt should carry User security_id");
+
+    // Cross-check: the resolve_security_descriptor path through $SII must
+    // produce the same SD blob that build_security_descriptor(class) produces
+    // for the User class — we exercise it through read_xattrs on the user
+    // file.
+    let xa_user = ntfs2.read_xattrs(&mut dev, "/u.txt").unwrap();
+    let xa_user_sd = xa_user
+        .get(xattr_keys::SECURITY)
+        .expect("user file should carry a resolved security descriptor");
+    let expected_user_sd = super::format::build_security_descriptor(SecurityClass::User);
+    assert_eq!(
+        xa_user_sd, &expected_user_sd,
+        "resolved User SD differs from build_security_descriptor(User)"
+    );
+}
+
+/// A file created on a *reopened* volume (the `fstool shell put` / FUSE-create
+/// path, not format-time `build`) must still carry a resolvable Everyone-access
+/// security descriptor. Without one (security_id 0 / no `$SECURITY_DESCRIPTOR`)
+/// Windows reports the file as having no permissions and refuses to open it.
+#[test]
+fn reopen_then_create_file_carries_user_security() {
+    use super::format::{build_security_descriptor, security_id_for};
+    use super::secure::SecurityClass;
+
+    // Format, flush, drop — a bare on-disk volume with no user files yet.
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.flush(&mut dev).unwrap();
+    drop(ntfs);
+
+    // Reopen (no format) and add a file — the reopen-mutate path.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    ntfs.create_file(
+        &mut dev,
+        "/added.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+    drop(ntfs);
+
+    // Reopen once more and confirm the file's security descriptor is the
+    // permissive User class (Everyone: FILE_ALL_ACCESS), resolvable via $Secure.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let rec = ntfs.lookup_path(&mut dev, "/added.txt").unwrap();
+    let sid = read_security_id_for_record(&mut ntfs, &mut dev, rec);
+    assert_ne!(
+        sid, 0,
+        "reopened-volume file has security_id 0 — Windows would deny access"
+    );
+    assert_eq!(
+        sid,
+        security_id_for(SecurityClass::User),
+        "reopened-volume file must carry the User (Everyone-access) security id"
+    );
+    let xa = ntfs.read_xattrs(&mut dev, "/added.txt").unwrap();
+    let sd = xa
+        .get(xattr_keys::SECURITY)
+        .expect("file must carry a resolvable security descriptor");
+    assert_eq!(
+        sd,
+        &build_security_descriptor(SecurityClass::User),
+        "resolved SD differs from the Everyone-access User descriptor"
+    );
+}
+
+/// Exercise the directory-batch cache's eviction path: build more
+/// directories with pending children than the batch cache holds
+/// (`DEFAULT_CAPACITY`), so directories are serialized mid-run on
+/// eviction as well as at final flush. A two-level tree keeps every
+/// individual directory small (within the writer's single-INDX-block
+/// budget) while still creating > capacity distinct parent directories.
+#[test]
+fn dir_batch_eviction_round_trip() {
+    use crate::fs::FileMeta;
+    use crate::fs::ntfs::Ntfs;
+    use crate::fs::ntfs::format::FormatOpts;
+
+    let mut dev = MemoryBackend::new(48 * 1024 * 1024);
+    let opts = FormatOpts {
+        volume_label: "EVICT".into(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+
+    // 8 top-level dirs × 9 sub-dirs = 72 second-level directories, each
+    // holding one file. 1 (root) + 8 + 72 = 81 parent directories carry
+    // pending entries — past the 64-directory cache, forcing evictions.
+    let n_top = 8;
+    let n_sub = 9;
+    for a in 0..n_top {
+        ntfs.create_dir(&mut dev, &format!("/a{a}"), FileMeta::default())
+            .unwrap();
+        for b in 0..n_sub {
+            let d = format!("/a{a}/b{b}");
+            ntfs.create_dir(&mut dev, &d, FileMeta::default()).unwrap();
+            let f = format!("{d}/f");
+            ntfs.create_file(
+                &mut dev,
+                &f,
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(format!("{a}-{b}").into_bytes())),
+                    len: format!("{a}-{b}").len() as u64,
+                },
+                FileMeta::default(),
+            )
+            .unwrap();
+        }
+    }
+    ntfs.flush(&mut dev).unwrap();
+
+    // Reopen and verify every directory + file survived to the image.
+    let mut dev2 = dev;
+    let mut ro = Ntfs::open(&mut dev2).unwrap();
+    let top: Vec<String> = ro
+        .list_path(&mut dev2, "/")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    for a in 0..n_top {
+        assert!(top.contains(&format!("a{a}")), "missing /a{a}: {top:?}");
+    }
+    for a in 0..n_top {
+        let subs: Vec<String> = ro
+            .list_path(&mut dev2, &format!("/a{a}"))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for b in 0..n_sub {
+            assert!(
+                subs.contains(&format!("b{b}")),
+                "missing /a{a}/b{b}: {subs:?}"
+            );
+            let files: Vec<String> = ro
+                .list_path(&mut dev2, &format!("/a{a}/b{b}"))
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(files, vec!["f".to_string()], "/a{a}/b{b} contents");
+        }
+    }
+}
+
+/// Cross-filesystem `chmod` over NTFS: `set_attrs` maps the owner-write
+/// bit onto `$STANDARD_INFORMATION`'s READONLY flag, and the change
+/// round-trips through a reopen (getattr re-derives the mode from that
+/// same flag). Also exercises the timestamp path.
+#[test]
+fn set_attrs_chmod_roundtrips_readonly_bit() {
+    use crate::fs::{Filesystem, SetAttrs};
+    use std::path::Path;
+
+    let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+    ntfs.create_file(
+        &mut dev,
+        "/perm.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hi\n".to_vec())),
+            len: 3,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.flush(&mut dev).unwrap();
+
+    // Freshly created regular file is writable → 0o644.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    assert_eq!(
+        ntfs.getattr(&mut dev, Path::new("/perm.txt")).unwrap().mode,
+        0o644
+    );
+
+    // chmod 0o444: owner loses write → READONLY set.
+    ntfs.set_attrs(
+        &mut dev,
+        Path::new("/perm.txt"),
+        SetAttrs {
+            mode: Some(0o444),
+            uid: Some(1000), // uid/gid must be ignored, not error.
+            gid: Some(1000),
+            atime: None,
+            mtime: Some(1_700_000_000),
+            ctime: None,
+        },
+    )
+    .unwrap();
+
+    // Reopen from disk and confirm the bit persisted.
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let a = ntfs.getattr(&mut dev, Path::new("/perm.txt")).unwrap();
+    assert_eq!(a.mode, 0o444, "READONLY should be set after chmod 0444");
+    assert_eq!(a.mtime, 1_700_000_000, "mtime should round-trip");
+
+    // chmod 0o644: owner regains write → READONLY cleared.
+    ntfs.set_attrs(
+        &mut dev,
+        Path::new("/perm.txt"),
+        SetAttrs {
+            mode: Some(0o644),
+            uid: None,
+            gid: None,
+            atime: None,
+            mtime: None,
+            ctime: None,
+        },
+    )
+    .unwrap();
+
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    assert_eq!(
+        ntfs.getattr(&mut dev, Path::new("/perm.txt")).unwrap().mode,
+        0o644,
+        "READONLY should be cleared after chmod 0644"
+    );
+
+    // The file's data must still be intact after the metadata rewrites.
+    let mut r = ntfs.open_file_reader(&mut dev, "/perm.txt").unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hi\n");
+}
+
+/// Once `$MFT` is fragmented enough that its run list stops fitting in
+/// record 0, NTFS spills the later `$DATA` segments into extension
+/// records named by record 0's `$ATTRIBUTE_LIST`. Taking only the first
+/// `$DATA` attribute truncated `$MFT`, so every record past the first
+/// fragment read back as "past the end of $MFT".
+///
+/// This rewrites a formatted volume's record 0 into that shape — same
+/// clusters, but described as two `$DATA` segments, the second living in
+/// an extension record — and checks a record in the tail segment still
+/// resolves.
+#[test]
+fn mft_bootstrap_follows_attribute_list_on_record_zero() {
+    use super::attribute::{TYPE_ATTRIBUTE_LIST, TYPE_DATA};
+    let (mut dev, _ntfs) = fresh_volume(8 * 1024 * 1024);
+    let (base_off, rec_size, cluster_size) = {
+        let ro = Ntfs::open(&mut dev).unwrap();
+        let b = ro.boot_sector();
+        (
+            b.mft_lcn * b.cluster_size() as u64,
+            b.mft_record_size() as usize,
+            b.cluster_size() as u64,
+        )
+    };
+    // Decode record 0: keep every attribute except $DATA verbatim, and
+    // pull $DATA's single extent apart.
+    let mut rec0 = vec![0u8; rec_size];
+    dev.read_at(base_off, &mut rec0).unwrap();
+    mft::apply_fixup(&mut rec0, mft::NTFS_BLOCK_SIZE).unwrap();
+    let hdr = mft::RecordHeader::parse(&rec0).unwrap();
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    let mut data: Option<(u64, u64, u64, u64, u64)> = None; // lcn, len, alloc, real, init
+    for a in AttributeIter::new(&rec0, hdr.first_attribute_offset as usize) {
+        let a = a.unwrap();
+        if a.type_code == TYPE_DATA {
+            match a.kind {
+                AttributeKind::NonResident {
+                    ref runs,
+                    allocated_size,
+                    real_size,
+                    initialized_size,
+                    ..
+                } => {
+                    assert_eq!(runs.len(), 1, "a fresh $MFT is one extent");
+                    data = Some((
+                        runs[0].lcn.unwrap(),
+                        runs[0].length,
+                        allocated_size,
+                        real_size,
+                        initialized_size,
+                    ));
+                }
+                _ => panic!("$MFT $DATA must be non-resident"),
+            }
+            continue;
+        }
+        keep.push(rec0[a.offset..a.offset + a.length as usize].to_vec());
+    }
+    let (lcn, clusters, allocated, real, initialized) = data.expect("$MFT has $DATA");
+    let records_per_cluster = cluster_size / rec_size as u64;
+    // Split three clusters off the tail. The extension record and every
+    // system record stay inside the leading segment; the marker record
+    // below lands in the tail one.
+    assert!(clusters > 4, "test needs a multi-cluster $MFT");
+    let split = clusters - 3;
+    let tail_first_record = split * records_per_cluster;
+    let marker_rec = tail_first_record + 1;
+    let ext_rec = tail_first_record - 4; // free, inside the head segment
+
+    // A recognisable record in the tail segment.
+    let mut marker = vec![0u8; rec_size];
+    format::emit_record(
+        &mut marker,
+        rec_size,
+        marker_rec,
+        mft::RecordHeader::FLAG_IN_USE,
+        &[format::build_resident_attr(
+            TYPE_DATA,
+            &[],
+            b"tail-segment marker",
+            0,
+            0,
+        )],
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off + marker_rec * rec_size as u64, &marker)
+        .unwrap();
+
+    // $DATA segment 0 (VCN 0..split) stays in record 0; segment 1 goes to
+    // the extension record.
+    let seg0 = format::build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &format::encode_run_list(&[(lcn, split)]),
+        0,
+        split - 1,
+        allocated,
+        real,
+        initialized,
+        0,
+        0,
+    );
+    let seg1 = format::build_non_resident_attr(
+        TYPE_DATA,
+        &[],
+        &format::encode_run_list(&[(lcn + split, clusters - split)]),
+        split,
+        clusters - 1,
+        allocated,
+        real,
+        initialized,
+        0,
+        0,
+    );
+    // $ATTRIBUTE_LIST: one 0x20-byte row per segment.
+    let mut alist = Vec::new();
+    for (vcn, rec) in [(0u64, 0u64), (split, ext_rec)] {
+        alist.extend_from_slice(&TYPE_DATA.to_le_bytes());
+        alist.extend_from_slice(&0x20u16.to_le_bytes());
+        alist.push(0); // name_len
+        alist.push(0x1A); // name_off
+        alist.extend_from_slice(&vcn.to_le_bytes());
+        alist.extend_from_slice(&(rec | (1u64 << 48)).to_le_bytes());
+        alist.extend_from_slice(&0u16.to_le_bytes()); // attribute_id
+        alist.extend_from_slice(&[0u8; 6]);
+    }
+    let alist_attr = format::build_resident_attr(TYPE_ATTRIBUTE_LIST, &[], &alist, 0, 0);
+
+    let mut attrs = keep;
+    attrs.push(alist_attr);
+    attrs.push(seg0);
+    let mut new0 = vec![0u8; rec_size];
+    format::emit_record(
+        &mut new0,
+        rec_size,
+        0,
+        mft::RecordHeader::FLAG_IN_USE,
+        &attrs,
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off, &new0).unwrap();
+
+    let mut ext = vec![0u8; rec_size];
+    format::emit_record(
+        &mut ext,
+        rec_size,
+        ext_rec,
+        mft::RecordHeader::FLAG_IN_USE,
+        &[seg1],
+        mft::NTFS_BLOCK_SIZE,
+        1,
+    )
+    .unwrap();
+    dev.write_at(base_off + ext_rec * rec_size as u64, &ext)
+        .unwrap();
+
+    // The reopened volume must stitch both segments together.
+    let mut ro = Ntfs::open(&mut dev).unwrap();
+    let mut got = vec![0u8; rec_size];
+    ro.read_mft_record(&mut dev, marker_rec, &mut got).unwrap();
+    let hdr = mft::RecordHeader::parse(&got).unwrap();
+    let mut found = false;
+    for a in AttributeIter::new(&got, hdr.first_attribute_offset as usize) {
+        let a = a.unwrap();
+        if let AttributeKind::Resident { value, .. } = a.kind {
+            assert_eq!(value, b"tail-segment marker");
+            found = true;
+        }
+    }
+    assert!(found, "marker record in the tail segment must be readable");
+    // The root directory (in the head segment) still lists normally.
+    assert!(ro.list_path(&mut dev, "/").is_ok());
+}
+
+/// A `FileSource::Reader` that hands over fewer bytes than it declared
+/// must be rejected, not padded with zeros: the declared length is
+/// already stamped into `$FILE_NAME` and the `$DATA` header, so padding
+/// invents file content.
+#[test]
+fn create_file_rejects_a_short_source() {
+    for declared in [64u64, 200_000] {
+        let (mut dev, mut ntfs) = fresh_volume(8 * 1024 * 1024);
+        let err = ntfs
+            .create_file(
+                &mut dev,
+                "/short.bin",
+                FileSource::Reader {
+                    reader: Box::new(std::io::Cursor::new(vec![b'x'; 8])),
+                    len: declared,
+                },
+                FileMeta::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a {declared}-byte promise with 8 bytes must fail"));
+        match err {
+            crate::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+}

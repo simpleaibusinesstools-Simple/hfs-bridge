@@ -1,0 +1,322 @@
+//! NTFS data-run list decoder.
+//!
+//! A non-resident attribute's data extents live as a compressed sequence
+//! of (length, offset) pairs called a "run list". Each entry starts with
+//! a 1-byte header where the low nibble encodes the byte length of the
+//! run-length field, and the high nibble encodes the byte length of the
+//! run-offset field. A header of 0x00 terminates the list.
+//!
+//! - The length field is unsigned LE, in clusters.
+//! - The offset field is a signed LE relative LCN delta from the previous
+//!   run. If the offset field length is 0, this is a sparse run (no LCN).
+//!
+//! Layout per "NTFS Documentation" (Russon & Fledel).
+
+use crate::Result;
+
+/// One extent of a non-resident attribute's data, in clusters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    /// Logical cluster number, or `None` for a sparse extent (reads as zero).
+    pub lcn: Option<u64>,
+    /// Number of clusters this extent covers.
+    pub length: u64,
+}
+
+/// A run list indexed for lookup by VCN.
+///
+/// A fragmented `$DATA` can run to thousands of extents, and the readers
+/// resolve one VCN per cluster read, so a linear walk per lookup made
+/// streaming quadratic in the fragment count. `starts` holds the prefix
+/// sums of the extent lengths — `starts[i]` is the first VCN of
+/// `runs[i]`, and the final element is the total cluster count — so a
+/// lookup is a binary search.
+#[derive(Debug, Clone, Default)]
+pub struct RunMap {
+    runs: Vec<Extent>,
+    starts: Vec<u64>,
+}
+
+impl RunMap {
+    /// Index `runs`. Lengths that overflow a `u64` in sum are rejected
+    /// here rather than at every lookup.
+    pub fn new(runs: Vec<Extent>) -> Result<Self> {
+        let mut starts = Vec::with_capacity(runs.len() + 1);
+        let mut acc: u64 = 0;
+        for ext in &runs {
+            starts.push(acc);
+            acc = acc.checked_add(ext.length).ok_or_else(|| {
+                crate::Error::InvalidImage("ntfs: run-list VCN length overflow".into())
+            })?;
+        }
+        starts.push(acc);
+        Ok(Self { runs, starts })
+    }
+
+    /// The extents, in VCN order.
+    pub fn runs(&self) -> &[Extent] {
+        &self.runs
+    }
+
+    /// Total clusters the list covers.
+    pub fn total_clusters(&self) -> u64 {
+        *self.starts.last().unwrap_or(&0)
+    }
+
+    /// The extent covering `vcn`, plus how far into it `vcn` sits.
+    /// `None` when `vcn` is past the end of the list.
+    pub fn lookup(&self, vcn: u64) -> Option<(Extent, u64)> {
+        if vcn >= self.total_clusters() {
+            return None;
+        }
+        // `starts` is sorted; find the last entry <= vcn.
+        let idx = match self.starts.binary_search(&vcn) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        // A zero-length extent can make several `starts` entries equal;
+        // step forward to the one that actually covers `vcn`.
+        let mut idx = idx;
+        while idx + 1 < self.runs.len() && self.starts[idx + 1] <= vcn {
+            idx += 1;
+        }
+        Some((self.runs[idx], vcn - self.starts[idx]))
+    }
+}
+
+impl From<RunMap> for Vec<Extent> {
+    fn from(m: RunMap) -> Self {
+        m.runs
+    }
+}
+
+/// Decode a run list from `buf`. Stops on the terminating 0x00 header or at
+/// the end of `buf`. Returns the parsed extents.
+pub fn decode(buf: &[u8]) -> Result<Vec<Extent>> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    let mut prev_lcn: i64 = 0;
+    while cursor < buf.len() {
+        let header = buf[cursor];
+        if header == 0 {
+            break;
+        }
+        cursor += 1;
+        let len_size = (header & 0x0F) as usize;
+        let off_size = ((header >> 4) & 0x0F) as usize;
+        if len_size == 0 || len_size > 8 || off_size > 8 {
+            return Err(crate::Error::InvalidImage(format!(
+                "ntfs: bad run-list header 0x{header:02x} at offset {cursor}"
+            )));
+        }
+        if cursor + len_size + off_size > buf.len() {
+            return Err(crate::Error::InvalidImage(
+                "ntfs: run-list truncated".into(),
+            ));
+        }
+        let length = read_unsigned_le(&buf[cursor..cursor + len_size]);
+        cursor += len_size;
+        let lcn = if off_size == 0 {
+            None
+        } else {
+            let delta = read_signed_le(&buf[cursor..cursor + off_size]);
+            cursor += off_size;
+            prev_lcn = prev_lcn
+                .checked_add(delta)
+                .ok_or_else(|| crate::Error::InvalidImage("ntfs: run-list LCN overflow".into()))?;
+            if prev_lcn < 0 {
+                return Err(crate::Error::InvalidImage(format!(
+                    "ntfs: run-list produced negative LCN {prev_lcn}"
+                )));
+            }
+            Some(prev_lcn as u64)
+        };
+        out.push(Extent { lcn, length });
+    }
+    Ok(out)
+}
+
+fn read_unsigned_le(b: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for (i, &byte) in b.iter().enumerate() {
+        v |= (byte as u64) << (8 * i);
+    }
+    v
+}
+
+fn read_signed_le(b: &[u8]) -> i64 {
+    let n = b.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut v = 0i64;
+    for (i, &byte) in b.iter().enumerate() {
+        v |= (byte as i64) << (8 * i);
+    }
+    // Sign-extend from the high byte's MSB. For n == 8 all 64 bits are
+    // already present, so no extension is needed (and `1 << 64` would be an
+    // out-of-range shift). Only extend when n < 8.
+    if n < 8 {
+        let sign_bit = 1i64 << (8 * n - 1);
+        if v & sign_bit != 0 {
+            v |= -1i64 << (8 * n);
+        }
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_single_run() {
+        // 0x21 0x18 0x34 0x12: length=1 byte (0x18=24), offset=2 bytes LE (0x1234=4660)
+        let runs = decode(&[0x21, 0x18, 0x34, 0x12, 0x00]).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].length, 24);
+        assert_eq!(runs[0].lcn, Some(4660));
+    }
+
+    #[test]
+    fn decode_sparse_run() {
+        // 0x01 0x08: length=1 byte (8 clusters), no offset → sparse.
+        let runs = decode(&[0x01, 0x08, 0x00]).unwrap();
+        assert_eq!(runs[0].lcn, None);
+        assert_eq!(runs[0].length, 8);
+    }
+
+    #[test]
+    fn decode_two_runs_relative() {
+        // 0x21 0x10 0x00 0x01 -> length=16, lcn=256
+        // 0x21 0x08 0x00 0x01 -> length=8, delta=+256 → lcn=512
+        // 0x00 terminator
+        let runs = decode(&[0x21, 0x10, 0x00, 0x01, 0x21, 0x08, 0x00, 0x01, 0x00]).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].lcn, Some(256));
+        assert_eq!(runs[1].lcn, Some(512));
+    }
+
+    #[test]
+    fn decode_negative_delta() {
+        // Second run delta is negative (FF = -1 in signed 1-byte).
+        let runs = decode(&[0x11, 0x04, 0x10, 0x11, 0x04, 0xFF, 0x00]).unwrap();
+        assert_eq!(runs[0].lcn, Some(0x10));
+        assert_eq!(runs[1].lcn, Some(0x0F));
+    }
+
+    #[test]
+    fn read_signed_le_full_width() {
+        // NTFS-1 regression: an 8-byte offset field must not perform an
+        // out-of-range `1 << 64` shift. All 64 bits are present, so no
+        // sign-extension is applied beyond the value itself.
+        assert_eq!(read_signed_le(&[0xFF; 8]), -1);
+        assert_eq!(read_signed_le(&0i64.to_le_bytes()), 0);
+        assert_eq!(read_signed_le(&i64::MIN.to_le_bytes()), i64::MIN);
+        assert_eq!(read_signed_le(&i64::MAX.to_le_bytes()), i64::MAX);
+        assert_eq!(
+            read_signed_le(&0x1234_5678_9abc_def0i64.to_le_bytes()),
+            0x1234_5678_9abc_def0
+        );
+    }
+
+    #[test]
+    fn decode_eight_byte_offset_positive() {
+        // header 0x81 = 1-byte length, 8-byte offset. Positive 8-byte LCN
+        // delta must decode to the exact value without panicking.
+        let runs = decode(&[
+            0x81, 0x04, 0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x00,
+        ])
+        .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].length, 4);
+        assert_eq!(runs[0].lcn, Some(0x1234_5678_9abc_def0));
+    }
+
+    #[test]
+    fn decode_eight_byte_offset_negative_is_clean_error() {
+        // An 8-byte delta of -1 from base 0 yields a negative absolute LCN.
+        // The decoder must reject it cleanly rather than panic on the
+        // sign-extension shift (NTFS-1).
+        let runs = decode(&[
+            0x81, 0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+        ]);
+        assert!(matches!(runs, Err(crate::Error::InvalidImage(_))));
+    }
+
+    /// `RunMap` must agree with a linear walk over the same extents at
+    /// every VCN, including sparse runs and the one past the end.
+    #[test]
+    fn run_map_lookup_matches_a_linear_walk() {
+        let runs = vec![
+            Extent {
+                lcn: Some(100),
+                length: 3,
+            },
+            Extent {
+                lcn: None,
+                length: 2,
+            },
+            Extent {
+                lcn: Some(50),
+                length: 4,
+            },
+        ];
+        let map = RunMap::new(runs.clone()).unwrap();
+        assert_eq!(map.total_clusters(), 9);
+        assert_eq!(map.runs(), &runs[..]);
+        for vcn in 0..9u64 {
+            // Linear reference.
+            let mut walked = 0u64;
+            let mut want = None;
+            for ext in &runs {
+                if vcn < walked + ext.length {
+                    want = Some((*ext, vcn - walked));
+                    break;
+                }
+                walked += ext.length;
+            }
+            let got = map.lookup(vcn).unwrap();
+            let want = want.unwrap();
+            assert_eq!((got.0.lcn, got.1), (want.0.lcn, want.1), "vcn {vcn}");
+        }
+        assert!(map.lookup(9).is_none());
+        assert!(map.lookup(u64::MAX).is_none());
+    }
+
+    /// Zero-length extents must not make a lookup land on them.
+    #[test]
+    fn run_map_skips_zero_length_extents() {
+        let map = RunMap::new(vec![
+            Extent {
+                lcn: Some(7),
+                length: 0,
+            },
+            Extent {
+                lcn: Some(9),
+                length: 2,
+            },
+        ])
+        .unwrap();
+        assert_eq!(map.lookup(0).unwrap().0.lcn, Some(9));
+        assert_eq!(
+            map.lookup(1).unwrap(),
+            (
+                Extent {
+                    lcn: Some(9),
+                    length: 2
+                },
+                1
+            )
+        );
+        assert!(map.lookup(2).is_none());
+    }
+
+    /// An empty list maps nothing.
+    #[test]
+    fn run_map_empty() {
+        let map = RunMap::new(Vec::new()).unwrap();
+        assert_eq!(map.total_clusters(), 0);
+        assert!(map.lookup(0).is_none());
+    }
+}

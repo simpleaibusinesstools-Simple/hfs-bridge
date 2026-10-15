@@ -1,0 +1,34 @@
+[
+  {
+    "CrateSource": "flate2-1.1.5/LICENSE-MIT",
+    "File": "flate2-MIT.txt",
+    "SHA256": "75D3BF11A47FED60AEE0A6CC56A97B896B470EE8FB52D6CD553BD8348337F422"
+  },
+  {
+    "CrateSource": "lzvn-core-0.1.2/LICENSE",
+    "File": "lzvn-core-APACHE.txt",
+    "SHA256": "CFC7749B96F63BD31C3C42B5C471BF756814053E847C10F3EB003417BC523D30"
+  },
+  {
+    "CrateSource": "flate2-1.1.5/LICENSE-APACHE",
+    "File": "flate2-APACHE.txt",
+    "SHA256": "A60EEA817514531668D7E00765731449FE14D059D3249E0BC93B36DE45F759F2"
+  },
+  {
+    "CrateSource": "lzfse_rust-0.2.1/LICENSE-APACHE",
+    "File": "lzfse-rust-APACHE.txt",
+    "SHA256": "65C4315BC9F8A9A2EC6B55B14DBE8BDB8FCEC977174B4C4E5CF756AF67DE9BAE"
+  },
+  {
+    "CrateSource": "lzfse_rust-0.2.1/LICENSE-MIT",
+    "File": "lzfse-rust-MIT.txt",
+    "SHA256": "F2E24C28F980FE2E6DB17159A86D01FE60638FB5821E02587ECD70F0A652921E"
+  },
+  {
+    "Source": "https://github.com/eafer/libzbitmap",
+    "Revision": "574abeae25b25c3319b9b6a9225cc7464e08ae88",
+    "Implementation": "Safe Rust decoder adapted from MIT-licensed reference; no C runtime linked",
+    "File": "lzbitmap-LICENSE.txt",
+    "SHA256": "40E65E7BA62903C113AE3F7DD582CC4E7A8E9719519A367381810F0D2D3539E2"
+  }
+]

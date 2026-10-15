@@ -1,0 +1,778 @@
+//! FAT32 modify-in-place: allocate clusters, insert/remove directory
+//! entries, and prune cluster chains.
+//!
+//! Unlike the format-time writer in `mod.rs`, these operations work on an
+//! [`Fat32`] that was opened from an existing image — they scan the FAT
+//! for free clusters rather than handing them out from a sequential
+//! counter, and they preserve directory-entry slack so an LFN run plus
+//! its 8.3 entry land in consecutive slots as the spec requires.
+
+use crate::io::Read;
+#[cfg(feature = "std")]
+use crate::path::Path;
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
+use super::{DirLayout, Fat32, SECTOR, dir, table};
+use crate::Result;
+use crate::block::BlockDevice;
+
+/// One child directory entry staged in [`Fat32`]'s directory-batch cache
+/// instead of being written to the parent's cluster chain immediately.
+/// `bytes` is the ready-to-write run of 32-byte slots (LFN + 8.3);
+/// `name` / `first_cluster` / `is_dir` let path lookups resolve the
+/// staged child as an in-memory overlay before it is serialized.
+#[derive(Debug, Clone)]
+pub(super) struct PendingEntry {
+    pub(super) bytes: Vec<u8>,
+    pub(super) name: String,
+    pub(super) first_cluster: u32,
+    pub(super) is_dir: bool,
+}
+
+/// Result of [`Fat32::find_entry`] — a directory's loaded byte buffer plus
+/// the position of the named entry (and any preceding LFN run) within it.
+pub(super) struct FoundEntry {
+    /// Where the directory's slots live on the device.
+    pub(super) layout: DirLayout,
+    /// The whole directory, concatenated.
+    pub(super) bytes: Vec<u8>,
+    /// Byte offset of the first slot of the LFN run (== entry_pos if none).
+    pub(super) run_start: usize,
+    /// Byte offset of the 8.3 entry itself.
+    pub(super) entry_pos: usize,
+    /// Decoded 8.3 entry.
+    pub(super) entry: dir::DirEntry,
+}
+
+impl Fat32 {
+    // -- cluster allocation on opened volumes ----------------------------
+
+    /// Allocate `n` free clusters by scanning the FAT, link them into one
+    /// chain (last → EOC), and return the chain. Starts at the FSInfo
+    /// `next_free` hint and wraps to cluster 2 if it hits the end.
+    pub(super) fn alloc_free_clusters(&mut self, n: u32) -> Result<Vec<u32>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let clusters = self.boot.cluster_count();
+        let mut found: Vec<u32> = Vec::with_capacity(n as usize);
+        let mut cur = self.next_free.clamp(2, clusters + 1);
+        // Scan up to two full sweeps before giving up.
+        for _ in 0..(2 * clusters) {
+            if cur >= clusters + 2 {
+                cur = 2;
+            }
+            if self.fat.get(cur) == table::FREE {
+                found.push(cur);
+                if found.len() as u32 == n {
+                    break;
+                }
+            }
+            cur += 1;
+        }
+        if (found.len() as u32) < n {
+            return Err(crate::Error::Unsupported(format!(
+                "fat32: only {} free clusters available, need {n}",
+                found.len()
+            )));
+        }
+        for w in found.windows(2) {
+            self.fat.set(w[0], w[1]);
+        }
+        let eoc = self.fat.eoc();
+        self.fat.set(*found.last().unwrap(), eoc);
+        // Hint the next search past the last cluster we just took.
+        self.next_free = found.last().unwrap().saturating_add(1);
+        Ok(found)
+    }
+
+    /// Free a whole cluster chain by setting every entry to FREE.
+    pub(super) fn free_chain(&mut self, start: u32) -> Result<()> {
+        if start < 2 {
+            return Ok(()); // zero-length file
+        }
+        let chain = self.fat.chain(start, self.boot.cluster_count())?;
+        for c in chain {
+            self.fat.set(c, table::FREE);
+        }
+        Ok(())
+    }
+
+    // -- directory-entry insertion / deletion ----------------------------
+
+    /// Read the directory at `dir_cluster` as a flat byte buffer, together
+    /// with the layout that maps positions in it back onto the device.
+    fn read_dir_with_layout(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+    ) -> Result<(DirLayout, Vec<u8>)> {
+        let layout = self.dir_layout(dir_cluster)?;
+        let bytes = layout.read_all(dev)?;
+        Ok((layout, bytes))
+    }
+
+    /// Insert `new_entries` (a run of 32-byte directory entries, ending
+    /// with the 8.3 entry) into the directory at `dir_cluster`. Extends
+    /// the directory's cluster chain if necessary — which the FAT12/16
+    /// fixed root cannot do, so overflowing it fails instead.
+    fn append_dir_entries(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        new_entries: &[u8],
+    ) -> Result<()> {
+        let (mut layout, mut bytes) = self.read_dir_with_layout(dev, dir_cluster)?;
+        let cb = self.cluster_bytes() as usize;
+        // Find the first end-of-directory slot (byte 0 == 0x00).
+        let mut end_pos = bytes.len();
+        for i in (0..bytes.len()).step_by(dir::ENTRY_SIZE) {
+            if bytes[i] == 0x00 {
+                end_pos = i;
+                break;
+            }
+        }
+        let need = new_entries.len();
+        let avail = bytes.len() - end_pos;
+        if avail < need {
+            // Grow the chain by the shortfall; `grow_dir` rejects the
+            // fixed root, which has nowhere to grow into.
+            let deficit = need - avail;
+            self.grow_dir(&mut layout, deficit.div_ceil(cb) as u32)?;
+            // Combined byte buffer: original + zero pad for new clusters.
+            bytes.resize(layout.len(), 0);
+        }
+        bytes[end_pos..end_pos + need].copy_from_slice(new_entries);
+        layout.write_range(dev, &bytes, end_pos, end_pos + need)?;
+        Ok(())
+    }
+
+    /// Locate the 8.3 entry whose long-or-short name equals `name` in the
+    /// directory at `dir_cluster`. Returns the *byte position* of the 8.3
+    /// entry within the directory's flat buffer, along with the position
+    /// of the first slot of its preceding LFN run (== same position when
+    /// there is no LFN run).
+    pub(super) fn find_entry(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<Option<FoundEntry>> {
+        let (layout, bytes) = self.read_dir_with_layout(dev, dir_cluster)?;
+        let mut lfn_start: Option<usize> = None;
+        let mut lfn_run: Vec<dir::LfnFragment> = Vec::new();
+        let mut i = 0;
+        while i + dir::ENTRY_SIZE <= bytes.len() {
+            let slot: &[u8; dir::ENTRY_SIZE] = (&bytes[i..i + dir::ENTRY_SIZE]).try_into().unwrap();
+            match dir::classify_slot(slot) {
+                dir::RawSlot::End => break,
+                dir::RawSlot::Deleted => {
+                    lfn_start = None;
+                    lfn_run.clear();
+                }
+                dir::RawSlot::Lfn(frag) => {
+                    if lfn_start.is_none() {
+                        lfn_start = Some(i);
+                    }
+                    lfn_run.push(frag);
+                }
+                dir::RawSlot::ShortEntry(mut entry) => {
+                    if entry.attr & dir::ATTR_VOLUME_ID != 0
+                        && entry.attr & dir::ATTR_DIRECTORY == 0
+                    {
+                        lfn_start = None;
+                        lfn_run.clear();
+                        i += dir::ENTRY_SIZE;
+                        continue;
+                    }
+                    entry.first_cluster = self.first_cluster_for_kind(entry.first_cluster);
+                    let short = entry.short_name_string();
+                    let long = dir::assemble_lfn(&lfn_run, &entry.name_83);
+                    let matches_short = short.eq_ignore_ascii_case(name);
+                    let matches_long = long
+                        .as_deref()
+                        .map(|l| l.eq_ignore_ascii_case(name))
+                        .unwrap_or(false);
+                    if matches_short || matches_long {
+                        let run_start = lfn_start.unwrap_or(i);
+                        return Ok(Some(FoundEntry {
+                            layout,
+                            bytes,
+                            run_start,
+                            entry_pos: i,
+                            entry,
+                        }));
+                    }
+                    lfn_start = None;
+                    lfn_run.clear();
+                }
+            }
+            i += dir::ENTRY_SIZE;
+        }
+        Ok(None)
+    }
+
+    /// Mark every slot in `[start_pos, end_pos_inclusive + ENTRY_SIZE)`
+    /// as deleted (first byte 0xE5).
+    fn mark_entries_deleted(
+        &self,
+        dev: &mut dyn BlockDevice,
+        layout: &DirLayout,
+        bytes: &mut [u8],
+        start_pos: usize,
+        end_pos: usize,
+    ) -> Result<()> {
+        let mut i = start_pos;
+        while i <= end_pos {
+            bytes[i] = 0xE5;
+            i += dir::ENTRY_SIZE;
+        }
+        layout.write_range(dev, bytes, start_pos, end_pos + dir::ENTRY_SIZE)?;
+        Ok(())
+    }
+
+    // -- public modify-in-place API --------------------------------------
+
+    /// Add a regular file at `dest_path` populated from a host file. The
+    /// parent directory must already exist; an existing entry at the same
+    /// destination is an error.
+    #[cfg(feature = "std")]
+    pub fn add_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dest_path: &str,
+        host_src: &Path,
+    ) -> Result<()> {
+        let md = std::fs::metadata(host_src)?;
+        let size = md.len();
+        let mtime = host_mtime_secs(&md);
+        let mut file = std::fs::File::open(host_src)?;
+        self.add_file_from_reader(dev, dest_path, &mut file, size, mtime)
+    }
+
+    /// Like `add_file` but pulls bytes from any [`Read`]
+    /// instead of a host filesystem path. The reader must produce exactly
+    /// `size` bytes; used by the repack path to stream content directly
+    /// from another opened filesystem. `mtime` is Unix epoch seconds (`0`
+    /// for none) and is stored in the directory entry's date/time fields.
+    pub fn add_file_from_reader(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dest_path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        mtime: u32,
+    ) -> Result<()> {
+        // The 8.3 entry stores the size in 32 bits; anything larger would
+        // be recorded modulo 4 GiB.
+        if size > u64::from(u32::MAX) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {dest_path:?} is {size} bytes; FAT files cannot exceed 4 GiB"
+            )));
+        }
+        let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
+        validate_leaf_name(&leaf)?;
+        let Some(taken) = self.scan_dir_for_create(dev, parent_cluster, &leaf)? else {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {dest_path:?} already exists"
+            )));
+        };
+        let cb = self.cluster_bytes();
+        let chain = if size == 0 {
+            Vec::new()
+        } else {
+            let n = size.div_ceil(cb) as u32;
+            self.alloc_free_clusters(n)?
+        };
+        self.stream_reader_chain(dev, reader, &chain, size)?;
+        let first = chain.first().copied().unwrap_or(0);
+        let mut entries: Vec<u8> = Vec::new();
+        self.push_dir_entry(
+            &mut entries,
+            &leaf,
+            dir::ATTR_ARCHIVE,
+            first,
+            size as u32,
+            mtime,
+            &taken,
+        )?;
+        self.stage_dir_entry(
+            dev,
+            parent_cluster,
+            PendingEntry {
+                bytes: entries,
+                name: leaf,
+                first_cluster: first,
+                is_dir: false,
+            },
+        )
+    }
+
+    fn stream_reader_chain(
+        &self,
+        dev: &mut dyn BlockDevice,
+        reader: &mut dyn Read,
+        chain: &[u32],
+        size: u64,
+    ) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let cb = self.cluster_bytes() as usize;
+        let mut buf = vec![0u8; cb];
+        let mut remaining = size;
+        for &c in chain {
+            let want = remaining.min(cb as u64) as usize;
+            buf[..want].fill(0);
+            reader.read_exact(&mut buf[..want])?;
+            dev.write_at(self.cluster_offset(c), &buf[..want])?;
+            remaining -= want as u64;
+            if remaining == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a directory at `dest_path`. The parent must already exist.
+    /// `mtime` is Unix epoch seconds (`0` for none).
+    pub fn add_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dest_path: &str,
+        mtime: u32,
+    ) -> Result<()> {
+        let (parent_cluster, leaf) = self.resolve_parent(dev, dest_path)?;
+        validate_leaf_name(&leaf)?;
+        let Some(taken) = self.scan_dir_for_create(dev, parent_cluster, &leaf)? else {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {dest_path:?} already exists"
+            )));
+        };
+        let chain = self.alloc_free_clusters(1)?;
+        let child_cluster = chain[0];
+        // Initialise the new directory with "." and ".." entries.
+        let mut dir_body: Vec<u8> = Vec::with_capacity(2 * dir::ENTRY_SIZE);
+        dir_body.extend_from_slice(&dot_entry(b".          ", child_cluster));
+        let parent_in_dotdot = if parent_cluster == self.boot.root_cluster {
+            0
+        } else {
+            parent_cluster
+        };
+        dir_body.extend_from_slice(&dot_entry(b"..         ", parent_in_dotdot));
+        let cb = self.cluster_bytes() as usize;
+        dir_body.resize(cb, 0);
+        dev.write_at(self.cluster_offset(child_cluster), &dir_body)?;
+
+        let mut entries: Vec<u8> = Vec::new();
+        self.push_dir_entry(
+            &mut entries,
+            &leaf,
+            dir::ATTR_DIRECTORY,
+            child_cluster,
+            0,
+            mtime,
+            &taken,
+        )?;
+        self.stage_dir_entry(
+            dev,
+            parent_cluster,
+            PendingEntry {
+                bytes: entries,
+                name: leaf,
+                first_cluster: child_cluster,
+                is_dir: true,
+            },
+        )
+    }
+
+    /// Stage a child entry for `parent_cluster` instead of rewriting the
+    /// parent's directory immediately. Serialized once on eviction or at
+    /// flush; [`resolve_parent`](Self::resolve_parent) reads the batch as
+    /// an overlay so staged children stay resolvable.
+    fn stage_dir_entry(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent_cluster: u32,
+        entry: PendingEntry,
+    ) -> Result<()> {
+        // Record the leaf name (ASCII-lowercased) in the per-parent index
+        // so the duplicate check is O(1) instead of scanning the growing
+        // batch, and its 8.3 name (the last slot of the run) so later
+        // siblings can pick a short name that does not collide with it.
+        self.pending_names
+            .entry(parent_cluster)
+            .or_default()
+            .insert(entry.name.to_ascii_lowercase());
+        if let Some(slot) = entry.bytes.len().checked_sub(dir::ENTRY_SIZE) {
+            let mut short = [0u8; 11];
+            short.copy_from_slice(&entry.bytes[slot..slot + 11]);
+            self.pending_shorts
+                .entry(parent_cluster)
+                .or_default()
+                .insert(short);
+        }
+        if let Some((victim, entries)) = self.dir_batch.stage(parent_cluster, entry) {
+            self.serialize_one_dir(dev, victim, entries)?;
+        }
+        Ok(())
+    }
+
+    /// Append a directory's whole pending batch to its cluster chain in
+    /// one pass (one chain read, one growth check, one write run) instead
+    /// of once per child.
+    fn serialize_one_dir(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        entries: Vec<PendingEntry>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut combined = Vec::new();
+        for e in &entries {
+            combined.extend_from_slice(&e.bytes);
+        }
+        self.append_dir_entries(dev, dir_cluster, &combined)
+    }
+
+    /// Serialize every pending directory batch (at flush, or before a
+    /// read path that consumes on-disk directory blocks).
+    pub(super) fn flush_dir_batches(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        for (dir_cluster, entries) in self.dir_batch.drain_all() {
+            self.serialize_one_dir(dev, dir_cluster, entries)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve a child of `dir_cluster` by name from the pending batch
+    /// (staged but not yet written). Returns `(first_cluster, is_dir)`.
+    fn pending_child(&self, dir_cluster: u32, name: &str) -> Option<(u32, bool)> {
+        self.dir_batch
+            .peek(&dir_cluster)?
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .map(|e| (e.first_cluster, e.is_dir))
+    }
+
+    /// One directory scan in preparation for creating `name` under
+    /// `dir_cluster`: `Ok(None)` if the name already exists (on disk or
+    /// staged in the pending batch), otherwise the set of 8.3 names
+    /// already in use in that directory — on disk plus staged — so the
+    /// caller can pick a generated short name that does not collide.
+    fn scan_dir_for_create(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+        name: &str,
+    ) -> Result<Option<BTreeSet<[u8; 11]>>> {
+        // O(1) check against the per-parent name index — covers both
+        // currently-pending entries and any already serialised in this
+        // session (`pending_names` only shrinks on `remove`).
+        if let Some(set) = self.pending_names.get(&dir_cluster)
+            && set.contains(&name.to_ascii_lowercase())
+        {
+            return Ok(None);
+        }
+        let bytes = self.read_dir_bytes(dev, dir_cluster)?;
+        let mut taken: BTreeSet<[u8; 11]> = BTreeSet::new();
+        let mut lfn_run: Vec<dir::LfnFragment> = Vec::new();
+        for slot in bytes.as_chunks::<{ dir::ENTRY_SIZE }>().0 {
+            match dir::classify_slot(slot) {
+                dir::RawSlot::End => break,
+                dir::RawSlot::Deleted => lfn_run.clear(),
+                dir::RawSlot::Lfn(frag) => lfn_run.push(frag),
+                dir::RawSlot::ShortEntry(entry) => {
+                    if entry.attr & dir::ATTR_VOLUME_ID != 0
+                        && entry.attr & dir::ATTR_DIRECTORY == 0
+                    {
+                        lfn_run.clear();
+                        continue;
+                    }
+                    let matches_short = entry.short_name_string().eq_ignore_ascii_case(name);
+                    let matches_long = dir::assemble_lfn(&lfn_run, &entry.name_83)
+                        .is_some_and(|l| l.eq_ignore_ascii_case(name));
+                    lfn_run.clear();
+                    if matches_short || matches_long {
+                        return Ok(None);
+                    }
+                    taken.insert(entry.name_83);
+                }
+            }
+        }
+        if let Some(staged) = self.pending_shorts.get(&dir_cluster) {
+            taken.extend(staged.iter().copied());
+        }
+        Ok(Some(taken))
+    }
+
+    /// Pick the 8.3 name for `name`: the name itself when it already is a
+    /// valid upper-case 8.3 name, otherwise a generated `FTxxxxxx` name
+    /// that is unique among `taken` (the directory's existing short
+    /// names). The sequence starts at the entry's first cluster — unique
+    /// volume-wide — or, for an entry with no cluster (an empty file), at
+    /// a hash of the long name, and probes upward until it is free.
+    pub(super) fn unique_short_name(
+        &self,
+        name: &str,
+        first_cluster: u32,
+        taken: &BTreeSet<[u8; 11]>,
+    ) -> Result<([u8; 11], bool)> {
+        let upper = name.to_ascii_uppercase();
+        if dir::is_valid_83(&upper) {
+            return Ok((dir::pack_83(&upper), upper != name));
+        }
+        let seed = if first_cluster >= 2 {
+            first_cluster
+        } else {
+            dir::short_name_seed(name)
+        };
+        // The generated form carries 24 bits of sequence; a full sweep is
+        // the hard bound on the probe.
+        for k in 0..(1u32 << 24) {
+            let candidate = dir::generate_83(name, seed.wrapping_add(k));
+            if !taken.contains(&candidate) {
+                return Ok((candidate, true));
+            }
+        }
+        Err(crate::Error::InvalidArgument(format!(
+            "fat32: no free 8.3 name for {name:?} in its directory"
+        )))
+    }
+
+    /// Remove a file, or an empty directory, at `path`. Returns
+    /// [`crate::Error::InvalidArgument`] for a non-empty directory.
+    pub fn remove(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<()> {
+        // The splice + emptiness check below read on-disk directory
+        // blocks; serialize all staged entries first so they are present.
+        self.flush_dir_batches(dev)?;
+        let (parent_cluster, leaf) = self.resolve_parent(dev, path)?;
+        let Some(FoundEntry {
+            layout,
+            mut bytes,
+            run_start,
+            entry_pos,
+            entry,
+        }) = self.find_entry(dev, parent_cluster, &leaf)?
+        else {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {path:?} not found"
+            )));
+        };
+        // Disallow removing "." / "..".
+        let short = entry.short_name_string();
+        if short == "." || short == ".." {
+            return Err(crate::Error::InvalidArgument(
+                "fat32: cannot remove . or ..".into(),
+            ));
+        }
+        if entry.attr & dir::ATTR_DIRECTORY != 0 {
+            // Empty-dir check: only "." and ".." entries beyond which all
+            // slots are free or end-of-dir.
+            if entry.first_cluster < 2 {
+                return Err(crate::Error::InvalidImage(
+                    "fat32: directory entry has no cluster".into(),
+                ));
+            }
+            let listed = self.list_path_by_cluster(dev, entry.first_cluster)?;
+            if !listed.is_empty() {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "fat32: directory {path:?} is not empty"
+                )));
+            }
+        }
+        if entry.first_cluster >= 2 {
+            self.free_chain(entry.first_cluster)?;
+        }
+        self.mark_entries_deleted(dev, &layout, &mut bytes, run_start, entry_pos)?;
+        // The name is gone from disk; forget it in the session indexes so
+        // it can be created again.
+        if let Some(set) = self.pending_names.get_mut(&parent_cluster) {
+            set.remove(&leaf.to_ascii_lowercase());
+        }
+        if let Some(set) = self.pending_shorts.get_mut(&parent_cluster) {
+            set.remove(&entry.name_83);
+        }
+        Ok(())
+    }
+
+    /// Set or clear the `ATTR_READ_ONLY` bit on the 8.3 entry for `path`,
+    /// rewriting only that entry's 32-byte slot in place. Used by the
+    /// cross-filesystem `chmod`: FAT has no Unix mode, so the requested
+    /// mode's owner-write bit maps onto this single attribute bit.
+    ///
+    /// Only byte 11 (the attr field) of the slot is touched, so the
+    /// entry's write date/time and every other field are preserved.
+    pub(super) fn set_entry_readonly(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        read_only: bool,
+    ) -> Result<()> {
+        // The lookup below reads on-disk directory blocks; serialize any
+        // staged entries first so a just-created file is locatable.
+        self.flush_dir_batches(dev)?;
+        let (parent_cluster, leaf) = self.resolve_parent(dev, path)?;
+        let Some(FoundEntry {
+            layout,
+            mut bytes,
+            entry_pos,
+            entry,
+            ..
+        }) = self.find_entry(dev, parent_cluster, &leaf)?
+        else {
+            return Err(crate::Error::InvalidArgument(format!(
+                "fat32: {path:?} not found"
+            )));
+        };
+        let mut attr = entry.attr;
+        if read_only {
+            attr |= dir::ATTR_READ_ONLY;
+        } else {
+            attr &= !dir::ATTR_READ_ONLY;
+        }
+        if attr == entry.attr {
+            return Ok(()); // already in the desired state
+        }
+        // Patch byte 11 (the attr field) of the 8.3 slot only, leaving the
+        // write date/time and all other fields untouched.
+        bytes[entry_pos + 11] = attr;
+        layout.write_range(dev, &bytes, entry_pos, entry_pos + dir::ENTRY_SIZE)?;
+        Ok(())
+    }
+
+    /// Split `path` into (parent_dir_cluster, leaf_name). Errors if the
+    /// path is `/` or if the parent doesn't exist.
+    pub(super) fn resolve_parent(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<(u32, String)> {
+        let parts: Vec<&str> = path
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect();
+        let (last, prefix) = parts.split_last().ok_or_else(|| {
+            crate::Error::InvalidArgument("fat32: cannot operate on root \"/\"".into())
+        })?;
+        let mut cluster = self.boot.root_cluster;
+        for part in prefix {
+            // On-disk entry, or one still staged in this directory's batch
+            // (created this session, not yet serialized).
+            let (first_cluster, is_dir) = match self.find_entry(dev, cluster, part)? {
+                Some(found) => (
+                    found.entry.first_cluster,
+                    found.entry.attr & dir::ATTR_DIRECTORY != 0,
+                ),
+                None => self.pending_child(cluster, part).ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "fat32: parent {part:?} of {path:?} does not exist"
+                    ))
+                })?,
+            };
+            if !is_dir {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "fat32: {part:?} is not a directory"
+                )));
+            }
+            cluster = if first_cluster == 0 {
+                self.boot.root_cluster
+            } else {
+                first_cluster
+            };
+        }
+        Ok((cluster, (*last).to_string()))
+    }
+
+    /// List a directory by its starting cluster, returning generic entries.
+    /// Wraps [`Fat32::list_cluster`](super::Fat32) so [`remove`] can run an
+    /// empty-dir check without going through the path resolver.
+    fn list_path_by_cluster(
+        &self,
+        dev: &mut dyn BlockDevice,
+        dir_cluster: u32,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        self.list_cluster(dev, dir_cluster)
+    }
+
+    /// Append a "long-name-aware" directory entry run (LFN fragments + 8.3
+    /// entry) for `name` into `entries`. `taken` is the directory's set of
+    /// short names already in use (see
+    /// [`scan_dir_for_create`](Self::scan_dir_for_create)), which a
+    /// generated 8.3 name must not collide with.
+    #[allow(clippy::too_many_arguments)]
+    fn push_dir_entry(
+        &self,
+        entries: &mut Vec<u8>,
+        name: &str,
+        attr: u8,
+        first_cluster: u32,
+        file_size: u32,
+        mtime: u32,
+        taken: &BTreeSet<[u8; 11]>,
+    ) -> Result<()> {
+        let (name_83, need_lfn) = self.unique_short_name(name, first_cluster, taken)?;
+        if need_lfn {
+            let csum = dir::lfn_checksum(&name_83);
+            for frag in dir::encode_lfn_run(name, csum) {
+                entries.extend_from_slice(&frag);
+            }
+        }
+        let entry = dir::DirEntry {
+            name_83,
+            attr,
+            first_cluster,
+            file_size,
+            mtime,
+        };
+        entries.extend_from_slice(&entry.encode());
+        Ok(())
+    }
+}
+
+/// Longest file name VFAT can store: 255 UTF-16 code units (20 LFN
+/// slots of 13 characters, minus the terminator).
+pub const MAX_NAME_UNITS: usize = 255;
+
+/// Reject a leaf name the on-disk LFN run cannot represent.
+fn validate_leaf_name(leaf: &str) -> Result<()> {
+    let units = leaf.encode_utf16().count();
+    if units > MAX_NAME_UNITS {
+        return Err(crate::Error::InvalidArgument(format!(
+            "fat32: name {leaf:?} is {units} UTF-16 units; the limit is {MAX_NAME_UNITS}"
+        )));
+    }
+    Ok(())
+}
+
+fn dot_entry(name_83: &[u8; 11], cluster: u32) -> [u8; dir::ENTRY_SIZE] {
+    dir::DirEntry {
+        name_83: *name_83,
+        attr: dir::ATTR_DIRECTORY,
+        first_cluster: cluster,
+        file_size: 0,
+        mtime: 0,
+    }
+    .encode()
+}
+
+/// Host file modification time as Unix epoch seconds, or `0` if unavailable
+/// (or before the epoch). Portable across platforms via `Metadata::modified`.
+#[cfg(feature = "std")]
+pub(super) fn host_mtime_secs(md: &std::fs::Metadata) -> u32 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().min(u64::from(u32::MAX)) as u32)
+        .unwrap_or(0)
+}
+
+// `cluster_offset` and `cluster_bytes` are on the parent impl; export them
+// here via re-import so the helpers above can call them through `self`.
+#[allow(dead_code)]
+const _: u32 = SECTOR; // keep the import used

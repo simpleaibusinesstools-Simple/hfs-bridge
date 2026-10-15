@@ -1,0 +1,1088 @@
+#![cfg(all(unix, feature = "ntfs"))]
+//! NTFS end-to-end validation against the ntfs-3g toolset.
+//!
+//! Tests in this file cross-check fstool's NTFS writer with the canonical
+//! Linux ntfs-3g userspace tools:
+//!
+//! * `ntfsfix --no-action` — read-only consistency check.
+//! * `ntfsls` — directory listing of a fstool-written image.
+//! * `ntfscat` — byte-for-byte extraction of a file fstool wrote.
+//! * `mkntfs` (reverse direction) — format a volume with mkntfs and have
+//!   `Ntfs::open` walk root and read the volume label.
+//!
+//! Every test silently skips when the required tool isn't on `PATH`, so
+//! a developer machine without ntfs-3g installed still runs `cargo test`
+//! cleanly. The mount-via-`ntfs-3g` direction needs root and is documented
+//! rather than executed.
+
+use std::process::Command;
+
+use fstool::block::{BlockDevice, FileBackend};
+use fstool::fs::ntfs::attribute::{AttributeIter, AttributeKind, TYPE_VOLUME_NAME, decode_utf16le};
+use fstool::fs::ntfs::format::FormatOpts;
+use fstool::fs::ntfs::{Ntfs, mft};
+use fstool::fs::{FileMeta, FileSource};
+use tempfile::NamedTempFile;
+
+fn which(tool: &str) -> Option<std::path::PathBuf> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {tool}"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let p = s.trim();
+    if p.is_empty() { None } else { Some(p.into()) }
+}
+
+/// Format an NTFS volume to `tmp`, then plant a small tree and flush.
+/// Returns the populated `NamedTempFile`.
+fn build_image_with_tree(volume_bytes: u64) -> NamedTempFile {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), volume_bytes).unwrap();
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-EXT".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+
+    // Resident-data file at root.
+    ntfs.create_file(
+        &mut dev,
+        "/hello.txt",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(b"hello ntfs\n".to_vec())),
+            len: 11,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+
+    // Subdirectory + nested file.
+    ntfs.create_dir(&mut dev, "/sub", FileMeta::default())
+        .unwrap();
+    let nested: Vec<u8> = (0..8000).map(|i| (i & 0xFF) as u8).collect();
+    ntfs.create_file(
+        &mut dev,
+        "/sub/big.bin",
+        FileSource::Reader {
+            reader: Box::new(std::io::Cursor::new(nested)),
+            len: 8000,
+        },
+        FileMeta::default(),
+    )
+    .unwrap();
+
+    // Symlink (reparse point).
+    ntfs.create_symlink(&mut dev, "/link", "hello.txt", FileMeta::default())
+        .unwrap();
+
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+    tmp
+}
+
+/// Probe the writer-produced image with `ntfsls`. Returns `true` when
+/// ntfs-3g could mount it (root index is walkable). The current fstool
+/// NTFS writer doesn't insert every system file ($Secure, $UpCase, ...)
+/// into the root `$I30` index, so off-the-shelf ntfs-3g utilities refuse
+/// to mount the volume. When that's the case the writer-direction tests
+/// skip with a clear message rather than failing — the limitation is
+/// real but lives in src/, which this test file isn't allowed to touch.
+fn writer_image_is_mountable(path: &std::path::Path) -> bool {
+    let Ok(out) = Command::new("ntfsls").arg("--force").arg(path).output() else {
+        return false;
+    };
+    out.status.success()
+}
+
+/// `ntfsfix --no-action /path` must run cleanly and report a clean
+/// mount on an fstool-written image. Once `$Secure` is populated and the
+/// root `$I30` is stored in collation order, `ntfs-3g`'s mount succeeds
+/// and the report ends with "NTFS partition ... was processed
+/// successfully."
+#[test]
+fn writer_passes_ntfsfix_no_action() {
+    let Some(_) = which("ntfsfix") else {
+        eprintln!("skipping: ntfsfix not installed");
+        return;
+    };
+
+    let img = build_image_with_tree(16 * 1024 * 1024);
+
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    // Earlier writer revisions left `$Secure` empty, which caused
+    // ntfs-3g to abort with "Failed to open $Secure: No such file or
+    // directory". Guard against that regressing alongside the positive
+    // mount assertion.
+    assert!(
+        !combined.contains("Failed to open $Secure"),
+        "ntfsfix reports $Secure missing:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix did not cleanly mount the writer image:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// `ntfs-3g`-style mount probe: we can't actually loopback-mount inside
+/// `cargo test` (CAP_SYS_ADMIN required) but `ntfsls --force` walks the
+/// same `$Secure` open + root-directory traversal the kernel mount path
+/// uses. Skipped when `ntfsls` isn't installed.
+#[test]
+fn writer_image_ntfs3g_mountable() {
+    let Some(_) = which("ntfsls") else {
+        eprintln!("skipping: ntfsls not installed");
+        return;
+    };
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let out = Command::new("ntfsls")
+        .arg("--force")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "ntfsls (ntfs-3g userspace) failed to walk the writer image:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to open $Secure"),
+        "ntfsls reports $Secure missing:\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hello.txt"),
+        "ntfsls did not list /hello.txt:\n{stdout}"
+    );
+}
+
+/// `ntfsls /path` must list the names we planted at root. Skipped when
+/// the writer-produced image isn't mountable by ntfs-3g (see notes on
+/// `writer_image_is_mountable`).
+#[test]
+fn writer_files_visible_via_ntfsls() {
+    let Some(_) = which("ntfsls") else {
+        eprintln!("skipping: ntfsls not installed");
+        return;
+    };
+
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    if !writer_image_is_mountable(img.path()) {
+        eprintln!(
+            "skipping: ntfs-3g cannot mount the writer's image \
+             (writer doesn't index system files in root $I30 yet)"
+        );
+        return;
+    }
+
+    let out = Command::new("ntfsls")
+        .arg("--force")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "ntfsls failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hello.txt"),
+        "ntfsls missing /hello.txt:\n{stdout}"
+    );
+    assert!(stdout.contains("sub"), "ntfsls missing /sub:\n{stdout}");
+    assert!(stdout.contains("link"), "ntfsls missing /link:\n{stdout}");
+}
+
+/// `ntfscat /path /hello.txt` must return the exact bytes we wrote.
+/// Skipped when the writer-produced image isn't mountable by ntfs-3g.
+#[test]
+fn writer_files_extractable_via_ntfscat() {
+    let Some(_) = which("ntfscat") else {
+        eprintln!("skipping: ntfscat not installed");
+        return;
+    };
+    let Some(_) = which("ntfsls") else {
+        eprintln!("skipping: ntfsls not installed (needed for mountability probe)");
+        return;
+    };
+
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    if !writer_image_is_mountable(img.path()) {
+        eprintln!(
+            "skipping: ntfs-3g cannot mount the writer's image \
+             (writer doesn't index system files in root $I30 yet)"
+        );
+        return;
+    }
+
+    let out = Command::new("ntfscat")
+        .arg("--force")
+        .arg(img.path())
+        .arg("/hello.txt")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "ntfscat failed:\nstderr:\n{stderr}");
+    assert_eq!(
+        out.stdout, b"hello ntfs\n",
+        "ntfscat returned wrong bytes for /hello.txt"
+    );
+
+    // Also verify the non-resident nested file.
+    let out2 = Command::new("ntfscat")
+        .arg("--force")
+        .arg(img.path())
+        .arg("/sub/big.bin")
+        .output()
+        .unwrap();
+    assert!(
+        out2.status.success(),
+        "ntfscat /sub/big.bin failed:\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let expected: Vec<u8> = (0..8000).map(|i| (i & 0xFF) as u8).collect();
+    assert_eq!(
+        out2.stdout, expected,
+        "ntfscat returned wrong bytes for /sub/big.bin"
+    );
+}
+
+/// Decode the volume name from MFT record 3 ($Volume) by walking its
+/// `TYPE_VOLUME_NAME` attribute. Returns the UTF-16LE-decoded label.
+fn read_volume_label(ntfs: &mut Ntfs, dev: &mut dyn BlockDevice) -> Option<String> {
+    let rec_size = ntfs.mft_record_size() as usize;
+    let mut buf = vec![0u8; rec_size];
+    ntfs.read_mft_record(dev, 3, &mut buf).ok()?;
+    let hdr = mft::RecordHeader::parse(&buf).ok()?;
+    for attr_res in AttributeIter::new(&buf, hdr.first_attribute_offset as usize) {
+        let attr = attr_res.ok()?;
+        if attr.type_code == TYPE_VOLUME_NAME
+            && let AttributeKind::Resident { value, .. } = attr.kind
+        {
+            return Some(decode_utf16le(value));
+        }
+    }
+    None
+}
+
+/// Format a volume with `mkntfs`, then have fstool open it: confirms our
+/// reader agrees with the canonical writer.
+#[test]
+fn mkntfs_image_opens_and_label_matches() {
+    let Some(_) = which("mkntfs") else {
+        eprintln!("skipping: mkntfs not installed");
+        return;
+    };
+    let Some(_) = which("ntfsls") else {
+        eprintln!("skipping: ntfsls not installed");
+        return;
+    };
+
+    // 16 MiB sparse backing file; mkntfs needs at least a few MiB to
+    // place all metadata streams.
+    let tmp = NamedTempFile::new().unwrap();
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        f.set_len(16 * 1024 * 1024).unwrap();
+    }
+
+    let label = "TEST-NTFS";
+    let out = Command::new("mkntfs")
+        .arg("-f") // fast (skip zero-pass)
+        .arg("-F") // force despite errors / non-block device
+        .arg("-L")
+        .arg(label)
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "mkntfs failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // fstool opens it.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+    let got_label = read_volume_label(&mut ntfs, &mut dev)
+        .expect("could not read $Volume:$VOLUME_NAME from mkntfs image");
+    assert_eq!(got_label, label, "volume label mismatch");
+
+    // Root listing from fstool — drop NTFS metadata entries (dollar-prefixed)
+    // for comparison with ntfsls's default output, which also hides them.
+    let root_entries = ntfs.list_path(&mut dev, "/").unwrap();
+    let mut fstool_names: Vec<String> = root_entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| !n.starts_with('$') && n != "." && n != "..")
+        .collect();
+    fstool_names.sort();
+
+    // ntfsls without -s also hides system files. -a is the default per the
+    // manpage; restrict to non-system entries by NOT passing -s.
+    let ntfsls_out = Command::new("ntfsls")
+        .arg("--force")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        ntfsls_out.status.success(),
+        "ntfsls failed:\n{}",
+        String::from_utf8_lossy(&ntfsls_out.stderr)
+    );
+    let ntfsls_stdout = String::from_utf8_lossy(&ntfsls_out.stdout);
+    let mut ntfsls_names: Vec<String> = ntfsls_stdout
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.starts_with('$') && s != "." && s != "..")
+        .collect();
+    ntfsls_names.sort();
+
+    assert_eq!(
+        fstool_names, ntfsls_names,
+        "fstool root listing disagrees with ntfsls\nfstool: {fstool_names:?}\nntfsls: {ntfsls_names:?}"
+    );
+}
+
+/// Reopen-mutate: a *flushed* NTFS image (handle dropped) must accept new
+/// files when re-opened via `Ntfs::open`, the way a consumer would use an
+/// NTFS filesystem inside a qcow2 as a read/write store. Exercises the
+/// lazy writer reconstruction (`ensure_writer`): no `format` on the
+/// reopened handle.
+///
+/// Verifies: (1) the new file round-trips through a *third* open;
+/// (2) a pre-existing file is untouched; (3) `ntfsfix --no-action` stays
+/// clean; (4) `ntfsls` lists the added name.
+#[test]
+fn reopen_then_add_file_roundtrips_and_validates() {
+    // Build + flush an initial tree, then drop the handle entirely.
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let path = img.path().to_path_buf();
+
+    // --- Reopen read-handle, mutate, flush (no format) ---
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        let body = b"added after reopen\n";
+        ntfs.create_file(
+            &mut dev,
+            "/added.txt",
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body.to_vec())),
+                len: body.len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        ntfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // --- Third open: the new file and the original are both present ---
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        let names: Vec<String> = ntfs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "added.txt"),
+            "reopened image missing the file added after reopen: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "hello.txt"),
+            "reopen-mutate clobbered the pre-existing tree: {names:?}"
+        );
+
+        let mut got = Vec::new();
+        {
+            let mut r = ntfs.open_file_reader(&mut dev, "/added.txt").unwrap();
+            std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        }
+        assert_eq!(got, b"added after reopen\n");
+
+        // Pre-existing file content survives.
+        let mut got2 = Vec::new();
+        {
+            let mut r2 = ntfs.open_file_reader(&mut dev, "/hello.txt").unwrap();
+            std::io::Read::read_to_end(&mut r2, &mut got2).unwrap();
+        }
+        assert_eq!(got2, b"hello ntfs\n");
+    }
+
+    // --- External oracles ---
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "ntfsfix did not cleanly mount the reopen-mutated image:\n{combined}"
+        );
+    } else {
+        eprintln!("skipping ntfsfix oracle: not installed");
+    }
+
+    if which("ntfsls").is_some() {
+        let out = Command::new("ntfsls")
+            .arg("--force")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ntfsls failed on reopen-mutated image:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("added.txt"),
+            "ntfsls did not list the reopen-added file:\n{stdout}"
+        );
+    } else {
+        eprintln!("skipping ntfsls oracle: not installed");
+    }
+}
+
+/// NTFS char / block device round-trip through ntfs-3g's `INTX_FILE`
+/// representation. Plants a `/null` (char 1:3) and `/loop0` (block 7:0)
+/// on a fresh volume, flushes, and verifies:
+///   * `ntfsfix --no-action` reports clean;
+///   * `ntfscat /<path>` returns exactly 24 bytes whose first 8 bytes
+///     are `IntxCHR\0` / `IntxBLK\0` and whose remaining 16 bytes
+///     decode to the (major, minor) we asked for — i.e. ntfs-3g sees
+///     the same `INTX_FILE` payload it would have written itself.
+///
+/// Also pins the negative contract: FIFO and socket return Unsupported
+/// (ntfs-3g's `INTX_FILE_TYPES` enum only knows LNK / CHR / BLK).
+#[test]
+fn writer_device_nodes_round_trip_via_ntfscat() {
+    if which("ntfsfix").is_none() {
+        eprintln!("skipping: ntfsfix not installed");
+        return;
+    }
+    if which("ntfscat").is_none() {
+        eprintln!("skipping: ntfscat not installed");
+        return;
+    }
+
+    // Fresh image (we don't reuse build_image_with_tree because we want
+    // a tighter root for the device-node assertions below).
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-DEV".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+
+    use fstool::fs::DeviceKind;
+    ntfs.create_device(
+        &mut dev,
+        "/null",
+        DeviceKind::Char,
+        1,
+        3,
+        FileMeta::default(),
+    )
+    .unwrap();
+    ntfs.create_device(
+        &mut dev,
+        "/loop0",
+        DeviceKind::Block,
+        7,
+        0,
+        FileMeta::default(),
+    )
+    .unwrap();
+
+    // Negative cases: FIFO / Socket reject cleanly.
+    let err = ntfs
+        .create_device(
+            &mut dev,
+            "/pipe",
+            DeviceKind::Fifo,
+            0,
+            0,
+            FileMeta::default(),
+        )
+        .expect_err("FIFO must reject on NTFS");
+    assert!(
+        matches!(err, fstool::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+    let err = ntfs
+        .create_device(
+            &mut dev,
+            "/sock",
+            DeviceKind::Socket,
+            0,
+            0,
+            FileMeta::default(),
+        )
+        .expect_err("socket must reject on NTFS");
+    assert!(matches!(err, fstool::Error::Unsupported(_)));
+
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // ntfsfix --no-action stays clean.
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix did not cleanly mount the device-node image:\n{combined}"
+    );
+
+    // ntfscat returns the 24-byte INTX_FILE payload byte-exact.
+    for (path, want_magic, major, minor) in [
+        ("/null", b"IntxCHR\0", 1u32, 3u32),
+        ("/loop0", b"IntxBLK\0", 7u32, 0u32),
+    ] {
+        let out = Command::new("ntfscat")
+            .arg("--force")
+            .arg(tmp.path())
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ntfscat failed on {path}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout.len(),
+            24,
+            "expected 24-byte INTX_FILE payload for {path}, got {} bytes",
+            out.stdout.len()
+        );
+        assert_eq!(
+            &out.stdout[..8],
+            want_magic,
+            "magic mismatch for {path}: got {:02x?}",
+            &out.stdout[..8]
+        );
+        let got_major = u64::from_le_bytes(out.stdout[8..16].try_into().unwrap());
+        let got_minor = u64::from_le_bytes(out.stdout[16..24].try_into().unwrap());
+        assert_eq!(got_major, major as u64, "major mismatch for {path}");
+        assert_eq!(got_minor, minor as u64, "minor mismatch for {path}");
+    }
+}
+
+/// Remove round-trip: build the standard tree (resident `hello.txt`,
+/// non-resident `sub/big.bin`, `link` symlink, `sub/` directory), drop
+/// the handle, reopen, remove each of them in dependency order, flush,
+/// reopen again and confirm:
+///   * the removed names are absent from `list_path`;
+///   * `lookup_path` on a removed name returns an error;
+///   * surviving siblings (none in this test, but the size invariant
+///     and `ntfsfix` cleanness stand in);
+///   * `ntfsfix --no-action` reports the volume mounted cleanly;
+///   * `ntfsls --force` does not list the removed names.
+#[test]
+fn remove_files_and_empty_dir_round_trip() {
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let path = img.path().to_path_buf();
+
+    // Phase 1: reopen, remove everything we can, flush.
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+
+        // Order matters: empty sub/ requires big.bin to be gone first.
+        ntfs.remove(&mut dev, "/link").unwrap();
+        ntfs.remove(&mut dev, "/sub/big.bin").unwrap();
+        ntfs.remove(&mut dev, "/sub").unwrap();
+        ntfs.remove(&mut dev, "/hello.txt").unwrap();
+
+        ntfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Phase 2: reopen — the names are gone, lookup_path errors.
+    {
+        let mut dev = FileBackend::open(&path).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        let names: Vec<String> = ntfs
+            .list_path(&mut dev, "/")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for gone in ["link", "sub", "hello.txt"] {
+            assert!(
+                !names.iter().any(|n| n == gone),
+                "expected {gone:?} to be gone, got {names:?}"
+            );
+        }
+        for gone in ["/link", "/sub", "/sub/big.bin", "/hello.txt"] {
+            assert!(
+                ntfs.lookup_path(&mut dev, gone).is_err(),
+                "lookup_path on removed {gone:?} unexpectedly succeeded"
+            );
+        }
+    }
+
+    // Phase 3: ntfsfix / ntfsls oracles.
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "ntfsfix did not cleanly mount the post-remove image:\n{combined}"
+        );
+    } else {
+        eprintln!("skipping ntfsfix oracle: not installed");
+    }
+
+    if which("ntfsls").is_some() {
+        let out = Command::new("ntfsls")
+            .arg("--force")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ntfsls failed after removes:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for gone in ["link", "sub", "hello.txt"] {
+            // `ntfsls` shows one entry per line; reject substring rather
+            // than exact-line match so trailing whitespace is tolerated.
+            for line in stdout.lines() {
+                assert!(
+                    line.trim() != gone,
+                    "ntfsls still lists removed name {gone:?}:\n{stdout}"
+                );
+            }
+        }
+    } else {
+        eprintln!("skipping ntfsls oracle: not installed");
+    }
+}
+
+/// Promoted-index removal: stuff a single directory with enough entries
+/// to force `promote_index_to_allocation` (one INDX block), then remove
+/// one entry from the middle of the block. Confirms the large-index
+/// branch of the splice path works and the image stays `ntfsfix`-clean.
+#[test]
+fn remove_from_promoted_index_passes_ntfsfix() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 16 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-REM-LG".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    ntfs.create_dir(&mut dev, "/many", FileMeta::default())
+        .unwrap();
+    // 16 files of ~50 chars each — pushes $INDEX_ROOT past
+    // MAX_INDEX_ROOT_BYTES (512) and forces promotion while still
+    // fitting inside the writer's single-INDX-block budget.
+    let mut planted: Vec<String> = Vec::new();
+    for i in 0..16 {
+        let name = format!("/many/entry-with-a-longish-name-{i:03}.txt");
+        ntfs.create_file(
+            &mut dev,
+            &name,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(format!("body-{i}\n").into_bytes())),
+                len: format!("body-{i}\n").len() as u64,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+        planted.push(name);
+    }
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // Reopen, remove one entry from the middle of the promoted block.
+    let victim_idx = planted.len() / 2;
+    let victim = &planted[victim_idx];
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        ntfs.remove(&mut dev, victim).unwrap();
+        ntfs.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Re-open and confirm the victim is gone but siblings remain.
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        assert!(
+            ntfs.lookup_path(&mut dev, victim).is_err(),
+            "victim still resolves after promoted-index remove"
+        );
+        let kids: Vec<String> = ntfs
+            .list_path(&mut dev, "/many")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(kids.len(), planted.len() - 1, "kids: {kids:?}");
+        for (i, name) in planted.iter().enumerate() {
+            let leaf = name.rsplit('/').next().unwrap();
+            if i == victim_idx {
+                assert!(!kids.iter().any(|k| k == leaf), "victim survived: {kids:?}");
+            } else {
+                assert!(kids.iter().any(|k| k == leaf), "sibling lost: {kids:?}");
+            }
+        }
+    }
+
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "ntfsfix not clean after promoted-index remove:\n{combined}"
+        );
+    } else {
+        eprintln!("skipping ntfsfix oracle: not installed");
+    }
+}
+
+/// Negative cases: removing the root, a system record, a missing path,
+/// or a non-empty directory all reject cleanly without corrupting the
+/// image (ntfsfix stays clean afterwards).
+#[test]
+fn remove_negative_cases_reject_cleanly() {
+    let img = build_image_with_tree(16 * 1024 * 1024);
+    let mut dev = FileBackend::open(img.path()).unwrap();
+    let mut ntfs = Ntfs::open(&mut dev).unwrap();
+
+    // Root.
+    let err = ntfs
+        .remove(&mut dev, "/")
+        .expect_err("remove of root must reject");
+    assert!(matches!(err, fstool::Error::InvalidArgument(_)));
+
+    // Missing path.
+    assert!(ntfs.remove(&mut dev, "/no-such-file").is_err());
+
+    // Non-empty directory.
+    let err = ntfs
+        .remove(&mut dev, "/sub")
+        .expect_err("remove of non-empty dir must reject");
+    assert!(
+        matches!(err, fstool::Error::InvalidArgument(_)),
+        "expected InvalidArgument for non-empty dir, got: {err:?}"
+    );
+
+    // The image must still be mountable (no half-state corruption).
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+    if which("ntfsfix").is_some() {
+        let out = Command::new("ntfsfix")
+            .arg("--no-action")
+            .arg(img.path())
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("Mounting volume... OK"),
+            "rejected removes corrupted the image:\n{combined}"
+        );
+    }
+}
+
+/// Large single-directory scale test: plant several thousand files in one
+/// directory so the writer must (a) grow the `$I30` index across multiple
+/// INDX blocks into a real B-tree, and (b) extend the `$MFT` by doubling
+/// its data region — which produces multi-cluster `$DATA` runs whose
+/// lengths (128, 256, …) exercise the signed run-length encoding. A length
+/// of 128 naively encodes as a single `0x80` byte, which ntfs-3g
+/// sign-extends to -128 and rejects ("Invalid length in mapping pairs
+/// array" → "Failed to load $MFT"). This is the regression guard for that
+/// fix: the volume must mount cleanly and list every entry.
+#[test]
+fn large_directory_scales_and_mounts_clean() {
+    if which("ntfsfix").is_none() {
+        eprintln!("skipping: ntfsfix not installed");
+        return;
+    }
+    const N: usize = 4000;
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(tmp.path(), 64 * 1024 * 1024).unwrap();
+    let opts = FormatOpts {
+        volume_label: "FSTOOL-BIG".to_string(),
+        ..Default::default()
+    };
+    let mut ntfs = Ntfs::format(&mut dev, &opts).unwrap();
+    ntfs.create_dir(&mut dev, "/big", FileMeta::default())
+        .unwrap();
+    for i in 0..N {
+        let name = format!("/big/file{i:05}");
+        let body = b"x".to_vec();
+        ntfs.create_file(
+            &mut dev,
+            &name,
+            FileSource::Reader {
+                reader: Box::new(std::io::Cursor::new(body)),
+                len: 1,
+            },
+            FileMeta::default(),
+        )
+        .unwrap();
+    }
+    ntfs.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // ntfsfix mounts $MFT + $MFTMirr and walks the structure.
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix could not mount the {N}-file volume:\n{combined}"
+    );
+    assert!(
+        !combined.contains("mapping pairs"),
+        "ntfsfix hit a mapping-pairs error (run-length regression):\n{combined}"
+    );
+
+    // ntfsls walks the promoted B-tree and lists every entry.
+    if which("ntfsls").is_some() {
+        let out = Command::new("ntfsls")
+            .arg("--force")
+            .arg("-p")
+            .arg("/big")
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ntfsls failed on the large directory:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let listed = stdout.lines().filter(|l| l.contains("file")).count();
+        assert_eq!(listed, N, "ntfsls listed {listed} of {N} files in /big");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Mount-via-ntfs-3g (manual only).
+//
+// Mounting a loopback image with ntfs-3g requires CAP_SYS_ADMIN, which
+// `cargo test` doesn't carry. Run this by hand after a `cargo test`:
+//
+//     fstool ntfs-build … img.bin
+//     sudo mkdir -p /mnt/ntfs-fstool
+//     sudo ntfs-3g -o ro img.bin /mnt/ntfs-fstool
+//     ls /mnt/ntfs-fstool
+//     sudo umount /mnt/ntfs-fstool
+//
+// The image produced by `build_image_with_tree` above should yield
+// hello.txt, sub/, link → hello.txt at the mount point.
+// ---------------------------------------------------------------------
+
+/// Cross-filesystem `chmod` over NTFS via [`Filesystem::set_attrs`]:
+/// the owner-write bit maps onto `$STANDARD_INFORMATION`'s READONLY DOS
+/// attribute. This test rewrites the bit on a reopened image, confirms
+/// the change round-trips through `getattr`, and validates that:
+///
+/// * `ntfsfix --no-action` still reports a clean mount afterwards, and
+/// * (best-effort, when ntfs-3g can read the file) `ntfsinfo -F` shows
+///   the READONLY flag toggling on then off.
+#[test]
+fn set_attrs_chmod_readonly_validates_with_ntfs3g() {
+    use fstool::fs::{Filesystem, SetAttrs};
+    use std::path::Path;
+
+    let Some(_) = which("ntfsfix") else {
+        eprintln!("skipping: ntfsfix not installed");
+        return;
+    };
+
+    let img = build_image_with_tree(16 * 1024 * 1024);
+
+    // chmod 0o444 on /hello.txt: owner loses write → READONLY set.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        ntfs.set_attrs(
+            &mut dev,
+            Path::new("/hello.txt"),
+            SetAttrs {
+                mode: Some(0o444),
+                uid: None,
+                gid: None,
+                atime: None,
+                mtime: None,
+                ctime: None,
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+
+    // Reopen and confirm getattr re-derives 0o444 from the READONLY bit.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        assert_eq!(
+            ntfs.getattr(&mut dev, Path::new("/hello.txt"))
+                .unwrap()
+                .mode,
+            0o444,
+            "READONLY should be set after chmod 0444"
+        );
+    }
+
+    // ntfsfix must stay clean after the metadata rewrite.
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix not clean after chmod 0444:\n{combined}"
+    );
+
+    // Best-effort ntfs-3g cross-check: ntfsinfo -F should list READONLY.
+    if which("ntfsinfo").is_some() {
+        let out = Command::new("ntfsinfo")
+            .arg("-F")
+            .arg("/hello.txt")
+            .arg(img.path())
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&out.stdout).to_uppercase();
+        if out.status.success() && info.contains("FILE ATTRIBUTES") {
+            // ntfsinfo prints the parsed DOS attribute flags, e.g.
+            // "File attributes: READONLY ARCHIVE (0x00000021)".
+            let line = info
+                .lines()
+                .find(|l| l.contains("FILE ATTRIBUTES"))
+                .unwrap_or("");
+            assert!(
+                line.contains("READONLY"),
+                "ntfsinfo -F did not show READONLY after chmod 0444:\n{info}"
+            );
+        }
+    }
+
+    // chmod 0o644: owner regains write → READONLY cleared.
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        ntfs.set_attrs(
+            &mut dev,
+            Path::new("/hello.txt"),
+            SetAttrs {
+                mode: Some(0o644),
+                uid: None,
+                gid: None,
+                atime: None,
+                mtime: None,
+                ctime: None,
+            },
+        )
+        .unwrap();
+        dev.sync().unwrap();
+    }
+
+    {
+        let mut dev = FileBackend::open(img.path()).unwrap();
+        let mut ntfs = Ntfs::open(&mut dev).unwrap();
+        assert_eq!(
+            ntfs.getattr(&mut dev, Path::new("/hello.txt"))
+                .unwrap()
+                .mode,
+            0o644,
+            "READONLY should be cleared after chmod 0644"
+        );
+    }
+
+    let out = Command::new("ntfsfix")
+        .arg("--no-action")
+        .arg(img.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Mounting volume... OK"),
+        "ntfsfix not clean after chmod 0644:\n{combined}"
+    );
+}

@@ -1,0 +1,1486 @@
+//! Tar archives as a "filesystem" in fstool's `AnyFs` sense.
+//!
+//! Tar isn't a real filesystem — it's a sequential archive — but it
+//! carries the same per-entry metadata as ext (path, mode, uid/gid,
+//! mtime, symlink target, device numbers, xattrs). That makes it a
+//! natural intermediate for `fstool repack`: ext → tar → ext mostly
+//! preserves the tree (timestamps get rounded to whole seconds; xattrs
+//! ride along as `SCHILY.xattr.*` PAX records).
+//!
+//! ## Scope
+//!
+//! - Read **ustar** + **PAX** entries with the records fstool cares
+//!   about: `path`, `linkpath`, `size`, `mtime`, and `SCHILY.xattr.*`.
+//! - Read GNU `L` / `K` long-name + long-link entries (the legacy form
+//!   most existing archives use).
+//! - Write **ustar** + **PAX** with the same coverage; PAX is emitted
+//!   whenever a field doesn't fit the plain ustar (long path, long
+//!   linkname, size > 8 GiB, non-ASCII path, xattrs present).
+//! - No compression. No sparse files. No global PAX headers. Hard links
+//!   are read but mapped to "regular file with same content" on
+//!   destination — preserving link semantics across FS types is a
+//!   separate problem.
+//!
+//! ## Sequential read path
+//!
+//! Tar has no on-disk index — a file is reached by scanning forward from
+//! the start. So the [`Tar`] handle holds **no** persistent index: every
+//! addressing operation (`list_path`, `open_file_reader`, `getattr`,
+//! `read_symlink`, `list_xattrs`) forward-scans the device once
+//! (`O(n)`), driven by the single `for_each_entry` primitive.
+//! `open` only validates the first block; it never builds a tree.
+
+pub mod header;
+pub mod pax;
+pub mod stream;
+
+pub use stream::{
+    BoundedReader, IndexedEntry, StreamEntry, TarStreamIndex, TarStreamReader, TarStreamWriter,
+};
+
+use std::collections::HashMap;
+use std::io::Read;
+
+use header::{BLOCK_SIZE, Header};
+
+use crate::Result;
+use crate::block::BlockDevice;
+use crate::fs::xattr::Xattr;
+
+/// Common write-side surface shared by [`TarWriter`] (BlockDevice-backed)
+/// and [`TarStreamWriter`] (Write-backed). Callers that walk a source
+/// filesystem and emit tar entries can be parametrised on this trait so
+/// the same walker drives both back-ends.
+pub trait TarSink {
+    fn add_file(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()>;
+    fn add_dir(&mut self, path: &str, meta: TarEntryMeta, xattrs: &[Xattr]) -> Result<()>;
+    fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()>;
+    fn add_device(
+        &mut self,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()>;
+}
+
+/// What a single tar entry represents on the destination side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Regular,
+    Dir,
+    Symlink,
+    HardLink,
+    CharDev,
+    BlockDev,
+    Fifo,
+}
+
+impl EntryKind {
+    fn from_typeflag(t: u8) -> Option<Self> {
+        Some(match t {
+            header::TYPEFLAG_REG | header::TYPEFLAG_REG_OLD | header::TYPEFLAG_CONT => {
+                Self::Regular
+            }
+            header::TYPEFLAG_DIR => Self::Dir,
+            header::TYPEFLAG_SYMLINK => Self::Symlink,
+            header::TYPEFLAG_HARDLINK => Self::HardLink,
+            header::TYPEFLAG_CHAR => Self::CharDev,
+            header::TYPEFLAG_BLOCK => Self::BlockDev,
+            header::TYPEFLAG_FIFO => Self::Fifo,
+            _ => return None,
+        })
+    }
+
+    /// Like [`Self::from_typeflag`], but also recognises pre-ustar (V7)
+    /// directories, which carry the old regular-file typeflag (`\0`) and a
+    /// name ending in `/`.
+    fn from_header(h: &header::Header) -> Option<Self> {
+        if h.typeflag == header::TYPEFLAG_REG_OLD && h.name.ends_with('/') {
+            return Some(Self::Dir);
+        }
+        Self::from_typeflag(h.typeflag)
+    }
+}
+
+/// One archived entry, fully resolved (PAX overrides applied).
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub path: String,
+    pub kind: EntryKind,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: u64,
+    pub size: u64,
+    pub link_target: Option<String>,
+    pub device_major: u32,
+    pub device_minor: u32,
+    /// File offset of the data block immediately after the header.
+    /// Only meaningful when `kind == Regular`.
+    pub data_offset: u64,
+    pub xattrs: Vec<Xattr>,
+}
+
+/// An opened tar archive.
+///
+/// Tar is a sequential format with no on-disk index, so this handle
+/// holds **no** persistent state — every read operation forward-scans
+/// the device via `for_each_entry`. `open` only validates the
+/// first block.
+pub struct Tar;
+
+/// A transient in-memory tree reconstructed by [`Tar::scan_index`] for a
+/// single operation, then dropped. Never persisted on the handle.
+struct TransientIndex {
+    entries: Vec<Entry>,
+    /// Normalised absolute path → index into `entries`.
+    by_path: HashMap<String, usize>,
+    /// Normalised absolute directory path → direct child names (archive
+    /// order).
+    children: HashMap<String, Vec<String>>,
+}
+
+impl Tar {
+    /// Open a tar archive. Does **not** scan — only light validation:
+    /// if the device holds at least one block, block 0 must be either an
+    /// all-zero block (an empty archive) or a header with a valid
+    /// checksum. Full parse errors surface per read operation.
+    pub fn open(dev: &mut dyn BlockDevice) -> Result<Self> {
+        let total = dev.total_size();
+        if total >= BLOCK_SIZE as u64 {
+            let mut block = [0u8; BLOCK_SIZE];
+            dev.read_at(0, &mut block)?;
+            if !header::is_zero_block(&block) && !Header::checksum_ok(&block) {
+                return Err(crate::Error::InvalidImage(
+                    "tar: bad header checksum at offset 0".into(),
+                ));
+            }
+        }
+        Ok(Self)
+    }
+
+    /// Forward-scan `dev` from offset 0, parsing every tar entry (ustar /
+    /// PAX / GNU long-name / long-link) until the two-zero-block EOF
+    /// marker, invoking `f` once per resolved [`Entry`]. Stops early when
+    /// `f` returns [`ControlFlow::Break`]. This is the single scanner
+    /// every read path reuses; nothing is retained across calls.
+    fn for_each_entry(
+        dev: &mut dyn BlockDevice,
+        mut f: impl FnMut(&Entry) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
+        let total = dev.total_size();
+        let mut pos = 0u64;
+        let mut block = [0u8; BLOCK_SIZE];
+        // PAX overrides that should be applied to the NEXT plain header.
+        let mut pending: PaxOverrides = PaxOverrides::default();
+        let mut consecutive_zero = 0u32;
+
+        while pos + BLOCK_SIZE as u64 <= total {
+            dev.read_at(pos, &mut block)?;
+            if header::is_zero_block(&block) {
+                consecutive_zero += 1;
+                pos += BLOCK_SIZE as u64;
+                if consecutive_zero >= 2 {
+                    break;
+                }
+                continue;
+            }
+            consecutive_zero = 0;
+            // Cheap sanity check: a real ustar header has the magic.
+            // If the checksum is wrong we still bail out — almost
+            // always indicates we walked off into garbage.
+            if !Header::checksum_ok(&block) {
+                return Err(crate::Error::InvalidImage(format!(
+                    "tar: bad header checksum at offset {pos}"
+                )));
+            }
+            let h = Header::decode(&block)?;
+            let data_off = pos + BLOCK_SIZE as u64;
+            // `h.size` is attacker-controlled; pad with a saturating add so a
+            // near-u64::MAX size can't wrap to a tiny value and desync the
+            // scan. (Such an entry won't fit `total` and is skipped anyway.)
+            let size_padded = h.size.saturating_add(511) & !511;
+            match h.typeflag {
+                header::TYPEFLAG_PAX => {
+                    // Read the PAX body.
+                    let body = read_meta_body_at(dev, data_off, h.size, "PAX header")?;
+                    pending.merge(pax::decode_records(&body)?);
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
+                    continue;
+                }
+                header::TYPEFLAG_PAX_GLOBAL => {
+                    // Ignore global headers — we don't propagate them.
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
+                    continue;
+                }
+                header::TYPEFLAG_GNU_LONGNAME => {
+                    let body = read_meta_body_at(dev, data_off, h.size, "GNU long name")?;
+                    pending.path = Some(trim_nul(body));
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
+                    continue;
+                }
+                header::TYPEFLAG_GNU_LONGLINK => {
+                    let body = read_meta_body_at(dev, data_off, h.size, "GNU long link")?;
+                    pending.linkpath = Some(trim_nul(body));
+                    let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                        break;
+                    };
+                    pos = next;
+                    continue;
+                }
+                _ => {}
+            }
+            let Some(kind) = EntryKind::from_header(&h) else {
+                // Unknown typeflag — skip the entry but warn.
+                eprintln!(
+                    "tar: skipping entry {:?} with unknown typeflag {:?}",
+                    h.full_name(),
+                    h.typeflag as char
+                );
+                let Some(next) = next_entry_pos(data_off, size_padded, total) else {
+                    break;
+                };
+                pos = next;
+                continue;
+            };
+
+            let path = pending.path.take().unwrap_or_else(|| h.full_name());
+            let link_target = pending.linkpath.take().or_else(|| {
+                if matches!(kind, EntryKind::Symlink | EntryKind::HardLink) {
+                    Some(h.linkname.clone())
+                } else {
+                    None
+                }
+            });
+            let size = pending.size.take().unwrap_or(h.size);
+            let mtime = pending.mtime.take().unwrap_or(h.mtime);
+            let xattrs = std::mem::take(&mut pending.xattrs);
+            // Strip trailing `/` from directory paths so paths are
+            // consistent.
+            let mut path = path;
+            if path.ends_with('/') {
+                path.pop();
+            }
+            let path = normalise_path(&path);
+            let entry = Entry {
+                path,
+                kind,
+                mode: h.mode,
+                uid: h.uid,
+                gid: h.gid,
+                mtime,
+                size,
+                link_target,
+                device_major: h.devmajor,
+                device_minor: h.devminor,
+                data_offset: data_off,
+                xattrs,
+            };
+
+            let body_padded = if matches!(kind, EntryKind::Regular) {
+                size.saturating_add(511) & !511
+            } else {
+                0
+            };
+            // Yield the entry even when its body is cut short by the end of
+            // the archive (a truncated final member is still listable); the
+            // scan then stops instead of computing a wrapped position.
+            let next = next_entry_pos(data_off, body_padded, total);
+
+            if let std::ops::ControlFlow::Break(()) = f(&entry) {
+                return Ok(());
+            }
+            let Some(next) = next else {
+                break;
+            };
+            pos = next;
+        }
+        Ok(())
+    }
+
+    /// Forward-scan and rebuild the full transient tree (flat entry list
+    /// plus path/children maps), exactly as the old `open` did — but the
+    /// result is used for a single operation and then dropped.
+    fn scan_index(dev: &mut dyn BlockDevice) -> Result<TransientIndex> {
+        let mut entries: Vec<Entry> = Vec::new();
+        Self::for_each_entry(dev, |e| {
+            entries.push(e.clone());
+            std::ops::ControlFlow::Continue(())
+        })?;
+
+        // Build the path → entry and parent → children maps.
+        let mut by_path = HashMap::new();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        // The root "/" exists implicitly even if the archive doesn't
+        // list it.
+        children.entry("/".into()).or_default();
+        for (i, e) in entries.iter().enumerate() {
+            by_path.insert(e.path.clone(), i);
+            // Register every path component under its parent — not just
+            // the direct parent — so an archive that stores `etc/conf`
+            // without an explicit `etc/` entry still lists `etc` under
+            // `/`. (A recursive `list()` walk depends on this.)
+            let comps: Vec<&str> = e.path.trim_start_matches('/').split('/').collect();
+            let mut parent = String::from("/");
+            for (depth, comp) in comps.iter().enumerate() {
+                let child_path = if parent == "/" {
+                    format!("/{comp}")
+                } else {
+                    format!("{parent}/{comp}")
+                };
+                let kids = children.entry(parent.clone()).or_default();
+                if !kids.iter().any(|k| k == comp) {
+                    kids.push((*comp).to_string());
+                }
+                // Intermediate components are directories; give them a
+                // children bucket so they list as dirs.
+                if depth + 1 < comps.len() {
+                    children.entry(child_path.clone()).or_default();
+                }
+                parent = child_path;
+            }
+            if matches!(e.kind, EntryKind::Dir) {
+                children.entry(e.path.clone()).or_default();
+            }
+        }
+        Ok(TransientIndex {
+            entries,
+            by_path,
+            children,
+        })
+    }
+
+    /// Forward-scan for a single entry by (normalised) path, returning it
+    /// owned. Stops at the first match.
+    fn find_entry(dev: &mut dyn BlockDevice, path: &str) -> Result<Option<Entry>> {
+        let want = normalise_path(path);
+        let mut found: Option<Entry> = None;
+        Self::for_each_entry(dev, |e| {
+            if e.path == want {
+                found = Some(e.clone());
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })?;
+        Ok(found)
+    }
+
+    /// All entries, forward-scanned and returned owned. `O(n)`.
+    pub fn entries(&self, dev: &mut dyn BlockDevice) -> Result<Vec<Entry>> {
+        let mut entries = Vec::new();
+        Self::for_each_entry(dev, |e| {
+            entries.push(e.clone());
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(entries)
+    }
+
+    /// Look up a single entry by path, forward-scanning the device.
+    pub fn lookup(&self, dev: &mut dyn BlockDevice, path: &str) -> Result<Option<Entry>> {
+        Self::find_entry(dev, path)
+    }
+
+    pub fn list_path(
+        &self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let path = normalise_path(path);
+        let idx = Self::scan_index(dev)?;
+        let entries = idx.children.get(&path).ok_or_else(|| {
+            crate::Error::InvalidArgument(format!("tar: no such directory {path:?}"))
+        })?;
+        let mut out = Vec::with_capacity(entries.len());
+        for name in entries {
+            let child_path = if path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{path}/{name}")
+            };
+            // Tar can have a file listed without its parent dir.
+            // Synthesise the missing parent on the fly: list it as Dir.
+            let kind = idx
+                .by_path
+                .get(&child_path)
+                .map(|&i| match idx.entries[i].kind {
+                    EntryKind::Dir => crate::fs::EntryKind::Dir,
+                    EntryKind::Regular | EntryKind::HardLink => crate::fs::EntryKind::Regular,
+                    EntryKind::Symlink => crate::fs::EntryKind::Symlink,
+                    EntryKind::CharDev => crate::fs::EntryKind::Char,
+                    EntryKind::BlockDev => crate::fs::EntryKind::Block,
+                    EntryKind::Fifo => crate::fs::EntryKind::Fifo,
+                })
+                .unwrap_or(crate::fs::EntryKind::Dir);
+            // "inode": fold the entry index for stability across runs.
+            let inode = idx.by_path.get(&child_path).copied().unwrap_or(0) as u32 + 1;
+            let size = if matches!(kind, crate::fs::EntryKind::Regular) {
+                idx.by_path
+                    .get(&child_path)
+                    .map(|&i| idx.entries[i].size)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            out.push(crate::fs::DirEntry {
+                name: name.clone(),
+                inode,
+                kind,
+                size,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Open a streaming reader over a regular file's archive content.
+    pub fn open_file_reader<'a>(
+        &self,
+        dev: &'a mut dyn BlockDevice,
+        path: &str,
+    ) -> Result<TarFileReader<'a>> {
+        // Scan for the entry, then (for a hard link) a second scan for
+        // its target — the target precedes the link, but a fresh forward
+        // scan is fine and keeps the handle index-free. Both scans end
+        // before `dev` is re-borrowed for the reader.
+        let e = Self::find_entry(dev, path)?
+            .ok_or_else(|| crate::Error::InvalidArgument(format!("tar: no such entry {path:?}")))?;
+        // A hard-link entry carries no body of its own — resolve to the
+        // target's data range so callers (incl. the repack walker) read
+        // the linked content rather than zero bytes.
+        let (offset, remaining) = match e.kind {
+            EntryKind::Regular => (e.data_offset, e.size),
+            EntryKind::HardLink => {
+                let tgt = e.link_target.clone().ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!("tar: hardlink {path:?} has no target"))
+                })?;
+                let te = Self::find_entry(dev, &tgt)?.ok_or_else(|| {
+                    crate::Error::InvalidArgument(format!(
+                        "tar: hardlink {path:?} → {tgt:?} target not found"
+                    ))
+                })?;
+                (te.data_offset, te.size)
+            }
+            _ => {
+                return Err(crate::Error::InvalidArgument(format!(
+                    "tar: {path:?} is not a regular file"
+                )));
+            }
+        };
+        Ok(TarFileReader {
+            dev,
+            offset,
+            remaining,
+        })
+    }
+}
+
+/// Read-only `Filesystem` adapter so `inspect::open(dev)` can return a
+/// `Box<dyn Filesystem>` that walks a tar archive. Writes return
+/// `Unsupported` — tar archives are sequential and `repack` is the
+/// only way to produce a new one.
+impl crate::fs::Filesystem for Tar {
+    fn create_file(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _src: crate::fs::FileSource,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Streaming {
+            kind: "tar",
+            op: "write",
+        })
+    }
+
+    fn create_dir(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Streaming {
+            kind: "tar",
+            op: "write",
+        })
+    }
+
+    fn create_symlink(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _target: &std::path::Path,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Streaming {
+            kind: "tar",
+            op: "write",
+        })
+    }
+
+    fn create_device(
+        &mut self,
+        _dev: &mut dyn BlockDevice,
+        _path: &std::path::Path,
+        _kind: crate::fs::DeviceKind,
+        _major: u32,
+        _minor: u32,
+        _meta: crate::fs::FileMeta,
+    ) -> Result<()> {
+        Err(crate::Error::Streaming {
+            kind: "tar",
+            op: "write",
+        })
+    }
+
+    fn remove(&mut self, _dev: &mut dyn BlockDevice, _path: &std::path::Path) -> Result<()> {
+        Err(crate::Error::Streaming {
+            kind: "tar",
+            op: "write",
+        })
+    }
+
+    fn list(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::DirEntry>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        Tar::list_path(self, dev, s)
+    }
+
+    fn read_file<'a>(
+        &'a mut self,
+        dev: &'a mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        let r = self.open_file_reader(dev, s)?;
+        Ok(Box::new(r))
+    }
+
+    fn flush(&mut self, _dev: &mut dyn BlockDevice) -> Result<()> {
+        Ok(())
+    }
+
+    fn access_mode(&self) -> crate::fs::AccessMode {
+        // tar has no index — a file is reached by scanning forward.
+        crate::fs::AccessMode::Sequential
+    }
+
+    fn mutation_capability(&self) -> crate::fs::MutationCapability {
+        crate::fs::MutationCapability::Streaming
+    }
+
+    fn read_symlink(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        let entry = Self::find_entry(dev, s)?
+            .ok_or_else(|| crate::Error::InvalidArgument(format!("tar: no entry at {s:?}")))?;
+        if !matches!(entry.kind, EntryKind::Symlink) {
+            return Err(crate::Error::InvalidArgument(format!(
+                "tar: {s:?} is not a symlink"
+            )));
+        }
+        entry
+            .link_target
+            .clone()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                crate::Error::InvalidArgument(format!("tar: symlink {s:?} has no link target"))
+            })
+    }
+
+    /// Surface the per-entry metadata tar carries (mode/uid/gid/mtime,
+    /// device numbers) so a generic walker preserves it. Hard links
+    /// report the target's size; synthesised intermediate dirs report
+    /// directory defaults.
+    fn getattr(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<crate::fs::FileAttrs> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        let dir_attrs = |inode: u32| crate::fs::FileAttrs {
+            kind: crate::fs::EntryKind::Dir,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            blocks: 0,
+            nlink: 2,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
+            rdev: 0,
+            inode,
+        };
+        if s == "/" || s.is_empty() {
+            return Ok(dir_attrs(1));
+        }
+        let p = normalise_path(s);
+        let idx = Self::scan_index(dev)?;
+        let Some(&i) = idx.by_path.get(&p) else {
+            // Intermediate directory present only as a path component.
+            if idx.children.contains_key(&p) {
+                return Ok(dir_attrs(0));
+            }
+            return Err(crate::Error::InvalidArgument(format!(
+                "tar: no entry at {p:?}"
+            )));
+        };
+        let e = &idx.entries[i];
+        let (kind, size) = match e.kind {
+            EntryKind::Regular => (crate::fs::EntryKind::Regular, e.size),
+            EntryKind::HardLink => {
+                let sz = e
+                    .link_target
+                    .as_ref()
+                    .map(|t| normalise_path(t))
+                    .and_then(|t| idx.by_path.get(&t).copied())
+                    .map(|ti| idx.entries[ti].size)
+                    .unwrap_or(0);
+                (crate::fs::EntryKind::Regular, sz)
+            }
+            EntryKind::Dir => (crate::fs::EntryKind::Dir, 0),
+            EntryKind::Symlink => (crate::fs::EntryKind::Symlink, 0),
+            EntryKind::CharDev => (crate::fs::EntryKind::Char, 0),
+            EntryKind::BlockDev => (crate::fs::EntryKind::Block, 0),
+            EntryKind::Fifo => (crate::fs::EntryKind::Fifo, 0),
+        };
+        let rdev = match e.kind {
+            EntryKind::CharDev | EntryKind::BlockDev => {
+                crate::fs::devnum::encode_devnum(e.device_major, e.device_minor)
+            }
+            _ => 0,
+        };
+        Ok(crate::fs::FileAttrs {
+            kind,
+            mode: e.mode,
+            uid: e.uid,
+            gid: e.gid,
+            size,
+            blocks: size.div_ceil(512),
+            nlink: 1,
+            atime: e.mtime as u32,
+            mtime: e.mtime as u32,
+            ctime: e.mtime as u32,
+            rdev,
+            inode: i as u32 + 1,
+        })
+    }
+
+    /// Surface the `SCHILY.xattr.*` PAX records tar parsed for `path`.
+    fn list_xattrs(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::fs::XattrPair>> {
+        let s = path
+            .to_str()
+            .ok_or_else(|| crate::Error::InvalidArgument("tar: non-UTF-8 path".into()))?;
+        Ok(Self::find_entry(dev, s)?
+            .map(|e| {
+                e.xattrs
+                    .iter()
+                    .map(|x| crate::fs::XattrPair {
+                        name: x.name.clone(),
+                        value: x.value.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+}
+
+#[derive(Default, Debug)]
+struct PaxOverrides {
+    path: Option<String>,
+    linkpath: Option<String>,
+    size: Option<u64>,
+    mtime: Option<u64>,
+    xattrs: Vec<Xattr>,
+}
+
+impl PaxOverrides {
+    fn merge(&mut self, records: Vec<pax::Record>) {
+        for r in records {
+            match r.key.as_str() {
+                pax::KEY_PATH => self.path = Some(String::from_utf8_lossy(&r.value).into_owned()),
+                pax::KEY_LINKPATH => {
+                    self.linkpath = Some(String::from_utf8_lossy(&r.value).into_owned())
+                }
+                pax::KEY_SIZE => {
+                    if let Ok(s) = std::str::from_utf8(&r.value)
+                        && let Ok(n) = s.parse::<u64>()
+                    {
+                        self.size = Some(n);
+                    }
+                }
+                pax::KEY_MTIME => {
+                    if let Ok(s) = std::str::from_utf8(&r.value) {
+                        // mtime may carry a fractional part (`123.456`);
+                        // we only support seconds-precision for now.
+                        let secs = s.split('.').next().unwrap_or(s);
+                        if let Ok(n) = secs.parse::<u64>() {
+                            self.mtime = Some(n);
+                        }
+                    }
+                }
+                k => {
+                    if let Some(name) = k.strip_prefix(pax::XATTR_PREFIX) {
+                        self.xattrs.push(Xattr {
+                            name: name.to_string(),
+                            value: r.value,
+                        });
+                    }
+                    // Other PAX keys (`charset`, `comment`, …) are
+                    // silently ignored.
+                }
+            }
+        }
+    }
+}
+
+fn trim_nul(mut v: Vec<u8>) -> String {
+    while let Some(&b) = v.last() {
+        if b == 0 {
+            v.pop();
+        } else {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&v).into_owned()
+}
+
+fn read_exact_at(dev: &mut dyn BlockDevice, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    dev.read_at(offset, &mut buf)?;
+    Ok(buf)
+}
+
+/// Read a metadata entry body (PAX / GNU long name / long link) at a fixed
+/// offset, rejecting an attacker-inflated `size` before allocating. These
+/// bodies are bounded by [`header::MAX_META_BODY`].
+/// Offset of the header following an entry whose body starts at `data_off`
+/// and occupies `body_padded` bytes (already rounded up to a block).
+///
+/// A GNU base-256 size can be anything up to `u64::MAX`, so the sum can
+/// wrap; a wrapped position would either panic or let the scan spin
+/// forever. `None` means the entry's body runs past the end of the archive
+/// — the scan treats that exactly like a truncated archive and stops.
+fn next_entry_pos(data_off: u64, body_padded: u64, total: u64) -> Option<u64> {
+    data_off
+        .checked_add(body_padded)
+        .filter(|&next| next <= total)
+}
+
+fn read_meta_body_at(
+    dev: &mut dyn BlockDevice,
+    offset: u64,
+    size: u64,
+    what: &str,
+) -> Result<Vec<u8>> {
+    if size > header::MAX_META_BODY as u64 {
+        return Err(crate::Error::InvalidImage(format!(
+            "tar: {what} body size {size} exceeds {} byte cap",
+            header::MAX_META_BODY
+        )));
+    }
+    read_exact_at(dev, offset, size as usize)
+}
+
+/// Normalise a path to start with `/` and not end with `/` (root is `/`).
+///
+/// `.` segments are dropped and `..` segments are resolved (or, at the
+/// root, discarded) so a malicious member path such as `../../etc/passwd`
+/// can't escape the archive root when the index is later consulted.
+pub(crate) fn normalise_path(p: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                // Pop the last real segment; at the root there's nothing
+                // to pop, so the `..` is simply discarded (can't escape).
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        return "/".into();
+    }
+    let mut out = String::new();
+    for seg in stack {
+        out.push('/');
+        out.push_str(seg);
+    }
+    out
+}
+
+/// Streaming reader over one regular-file entry. Reads through the
+/// backing `BlockDevice`'s `read_at`; nothing is buffered beyond the
+/// caller's destination slice.
+pub struct TarFileReader<'a> {
+    dev: &'a mut dyn BlockDevice,
+    offset: u64,
+    remaining: u64,
+}
+
+impl<'a> Read for TarFileReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let want = (buf.len() as u64).min(self.remaining) as usize;
+        self.dev
+            .read_at(self.offset, &mut buf[..want])
+            .map_err(std::io::Error::other)?;
+        self.offset += want as u64;
+        self.remaining -= want as u64;
+        Ok(want)
+    }
+}
+
+// -- writer side ---------------------------------------------------------
+
+/// Sequential tar writer. Each `add_*` call emits a PAX header (if any
+/// field requires it) plus the standard ustar header plus padded
+/// content. Call [`Self::finish`] when done to write the two-zero-block
+/// end marker.
+pub struct TarWriter<'a> {
+    dev: &'a mut dyn BlockDevice,
+    cursor: u64,
+    /// We grow the underlying device on demand. For a `FileBackend` this
+    /// works because the backing file's `set_len` was called by the
+    /// factory; we just track our own cursor against `total_size`.
+    capacity: u64,
+}
+
+impl<'a> TarWriter<'a> {
+    pub fn new(dev: &'a mut dyn BlockDevice) -> Self {
+        let capacity = dev.total_size();
+        Self {
+            dev,
+            cursor: 0,
+            capacity,
+        }
+    }
+
+    pub fn add_file(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        let needs_size_pax = !header::size_fits_ustar(size);
+        let mut records = pax::records_for_entry(path, None, needs_size_pax, xattrs);
+        if needs_size_pax {
+            records.push(pax::Record {
+                key: pax::KEY_SIZE.into(),
+                value: size.to_string().into_bytes(),
+            });
+        }
+        if !records.is_empty() {
+            self.write_pax_header(path, &records)?;
+        }
+        let h = build_header(
+            path,
+            header::TYPEFLAG_REG,
+            size,
+            None,
+            (0, 0),
+            &meta,
+            !records.is_empty(),
+        )?;
+        self.write_block(&h.encode()?)?;
+        // Stream the file content, padding to a 512-byte boundary.
+        let mut remaining = size;
+        let mut buf = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            reader
+                .read_exact(&mut buf[..want])
+                .map_err(crate::Error::from)?;
+            self.write_at_cursor(&buf[..want])?;
+            remaining -= want as u64;
+        }
+        // Pad to the next 512-byte boundary.
+        let pad = (BLOCK_SIZE - (size as usize % BLOCK_SIZE)) % BLOCK_SIZE;
+        if pad > 0 {
+            self.write_at_cursor(&[0u8; BLOCK_SIZE][..pad])?;
+        }
+        Ok(())
+    }
+
+    pub fn add_dir(&mut self, path: &str, meta: TarEntryMeta, xattrs: &[Xattr]) -> Result<()> {
+        let records = pax::records_for_entry(path, None, false, xattrs);
+        if !records.is_empty() {
+            self.write_pax_header(path, &records)?;
+        }
+        let h = build_header(
+            path,
+            header::TYPEFLAG_DIR,
+            0,
+            None,
+            (0, 0),
+            &meta,
+            !records.is_empty(),
+        )?;
+        self.write_block(&h.encode()?)?;
+        Ok(())
+    }
+
+    pub fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        let records = pax::records_for_entry(path, Some(target), false, xattrs);
+        if !records.is_empty() {
+            self.write_pax_header(path, &records)?;
+        }
+        let h = build_header(
+            path,
+            header::TYPEFLAG_SYMLINK,
+            0,
+            Some(target),
+            (0, 0),
+            &meta,
+            !records.is_empty(),
+        )?;
+        self.write_block(&h.encode()?)?;
+        Ok(())
+    }
+
+    pub fn add_device(
+        &mut self,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        let records = pax::records_for_entry(path, None, false, xattrs);
+        if !records.is_empty() {
+            self.write_pax_header(path, &records)?;
+        }
+        let typeflag = match kind {
+            crate::fs::DeviceKind::Char => header::TYPEFLAG_CHAR,
+            crate::fs::DeviceKind::Block => header::TYPEFLAG_BLOCK,
+            crate::fs::DeviceKind::Fifo => header::TYPEFLAG_FIFO,
+            crate::fs::DeviceKind::Socket => {
+                // tar doesn't represent sockets; emit a fifo to keep the
+                // tree intact and warn.
+                eprintln!("tar: socket {path:?} archived as FIFO (tar can't represent sockets)");
+                header::TYPEFLAG_FIFO
+            }
+        };
+        let h = build_header(
+            path,
+            typeflag,
+            0,
+            None,
+            (major, minor),
+            &meta,
+            !records.is_empty(),
+        )?;
+        self.write_block(&h.encode()?)?;
+        Ok(())
+    }
+
+    /// Finish the archive: write two zero blocks (EOF marker).
+    pub fn finish(&mut self) -> Result<()> {
+        self.write_block(&[0u8; BLOCK_SIZE])?;
+        self.write_block(&[0u8; BLOCK_SIZE])?;
+        self.dev.sync()?;
+        Ok(())
+    }
+
+    /// Bytes written so far. Used by the CLI to truncate the backing
+    /// file to the actual archive length (it may have been pre-sized).
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    fn write_block(&mut self, block: &[u8; BLOCK_SIZE]) -> Result<()> {
+        self.write_at_cursor(block)
+    }
+
+    fn write_at_cursor(&mut self, buf: &[u8]) -> Result<()> {
+        if self.cursor + buf.len() as u64 > self.capacity {
+            return Err(crate::Error::OutOfBounds {
+                offset: self.cursor,
+                len: buf.len() as u64,
+                size: self.capacity,
+            });
+        }
+        self.dev.write_at(self.cursor, buf)?;
+        self.cursor += buf.len() as u64;
+        Ok(())
+    }
+
+    fn write_pax_header(&mut self, ref_path: &str, records: &[pax::Record]) -> Result<()> {
+        let body = pax::encode_records(records);
+        // PAX header is itself a tar entry with typeflag 'x'.
+        let meta = TarEntryMeta {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            uname: String::new(),
+            gname: String::new(),
+        };
+        // Use a stable, ustar-safe name based on the leaf so we don't
+        // accidentally trigger another long-name escalation.
+        let pax_name = format!(
+            "{}/PaxHeaders/{}",
+            ".".strip_suffix('/').unwrap_or("."),
+            ref_path.rsplit('/').next().unwrap_or("entry")
+        );
+        let mut h = build_header(
+            &pax_name,
+            header::TYPEFLAG_PAX,
+            body.len() as u64,
+            None,
+            (0, 0),
+            &meta,
+            false,
+        )?;
+        // PAX header carries the size of `body` exactly.
+        h.size = body.len() as u64;
+        self.write_block(&h.encode()?)?;
+        // Body + pad.
+        self.write_at_cursor(&body)?;
+        let pad = (BLOCK_SIZE - (body.len() % BLOCK_SIZE)) % BLOCK_SIZE;
+        if pad > 0 {
+            self.write_at_cursor(&[0u8; BLOCK_SIZE][..pad])?;
+        }
+        Ok(())
+    }
+}
+
+/// Per-entry metadata for the writer. Mirrors a tar header's
+/// non-content fields; xattrs are passed separately because they emit
+/// PAX records.
+#[derive(Debug, Clone)]
+pub struct TarEntryMeta {
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime: u64,
+    pub uname: String,
+    pub gname: String,
+}
+
+impl Default for TarEntryMeta {
+    fn default() -> Self {
+        Self {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            uname: String::new(),
+            gname: String::new(),
+        }
+    }
+}
+
+fn build_header(
+    full_path: &str,
+    typeflag: u8,
+    size: u64,
+    linkname: Option<&str>,
+    dev: (u32, u32),
+    meta: &TarEntryMeta,
+    long_path_via_pax: bool,
+) -> Result<Header> {
+    // If the path fits ustar and we're not using PAX for it, fill name
+    // (and prefix). Otherwise put a short placeholder in `name` — the
+    // PAX `path` record overrides it on the read side.
+    let (name, prefix) = if !long_path_via_pax && pax::path_fits_ustar(full_path) {
+        split_path_for_ustar(full_path)
+    } else {
+        // Use the last 100 bytes of the path as the fallback name so
+        // tools that ignore PAX still get *something* coherent.
+        let leaf = full_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(full_path)
+            .chars()
+            .take(header::NAME_LEN)
+            .collect::<String>();
+        (leaf, String::new())
+    };
+    let (linkname_short, _link_via_pax) = match linkname {
+        Some(t) if t.len() <= header::LINKNAME_LEN && t.is_ascii() => (t.to_string(), false),
+        Some(t) => (
+            t.chars().take(header::LINKNAME_LEN).collect::<String>(),
+            true,
+        ),
+        None => (String::new(), false),
+    };
+    // A size beyond the 11-octal-digit ustar field travels in the PAX
+    // `size` record every add_file path emits for it; the ustar field then
+    // holds 0 (readers apply the PAX override) instead of failing to encode.
+    let ustar_size = if header::size_fits_ustar(size) {
+        size
+    } else {
+        0
+    };
+    Ok(Header {
+        name,
+        mode: meta.mode & 0o7777,
+        uid: meta.uid,
+        gid: meta.gid,
+        size: ustar_size,
+        mtime: meta.mtime,
+        typeflag,
+        linkname: linkname_short,
+        uname: meta.uname.clone(),
+        gname: meta.gname.clone(),
+        devmajor: dev.0,
+        devminor: dev.1,
+        prefix,
+    })
+}
+
+/// Split a path that's known to fit ustar into `(name, prefix)`.
+/// Caller has already checked [`pax::path_fits_ustar`].
+fn split_path_for_ustar(path: &str) -> (String, String) {
+    if path.len() <= header::NAME_LEN {
+        return (path.to_string(), String::new());
+    }
+    // Find the LATEST `/` such that the suffix fits in 100 bytes and
+    // the prefix fits in 155.
+    let bytes = path.as_bytes();
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] == b'/' && i <= header::PREFIX_LEN && bytes.len() - i - 1 <= header::NAME_LEN {
+            return (path[i + 1..].to_string(), path[..i].to_string());
+        }
+    }
+    // Shouldn't reach here if path_fits_ustar was true.
+    (path.to_string(), String::new())
+}
+
+// ── TarSink trait impls so the same walker drives both back-ends ───
+
+impl<'a> TarSink for TarWriter<'a> {
+    fn add_file(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarWriter::add_file(self, path, reader, size, meta, xattrs)
+    }
+    fn add_dir(&mut self, path: &str, meta: TarEntryMeta, xattrs: &[Xattr]) -> Result<()> {
+        TarWriter::add_dir(self, path, meta, xattrs)
+    }
+    fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarWriter::add_symlink(self, path, target, meta, xattrs)
+    }
+    fn add_device(
+        &mut self,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarWriter::add_device(self, path, kind, major, minor, meta, xattrs)
+    }
+}
+
+impl<W: std::io::Write> TarSink for TarStreamWriter<W> {
+    fn add_file(
+        &mut self,
+        path: &str,
+        reader: &mut dyn Read,
+        size: u64,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarStreamWriter::add_file(self, path, reader, size, meta, xattrs)
+    }
+    fn add_dir(&mut self, path: &str, meta: TarEntryMeta, xattrs: &[Xattr]) -> Result<()> {
+        TarStreamWriter::add_dir(self, path, meta, xattrs)
+    }
+    fn add_symlink(
+        &mut self,
+        path: &str,
+        target: &str,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarStreamWriter::add_symlink(self, path, target, meta, xattrs)
+    }
+    fn add_device(
+        &mut self,
+        path: &str,
+        kind: crate::fs::DeviceKind,
+        major: u32,
+        minor: u32,
+        meta: TarEntryMeta,
+        xattrs: &[Xattr],
+    ) -> Result<()> {
+        TarStreamWriter::add_device(self, path, kind, major, minor, meta, xattrs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::MemoryBackend;
+
+    #[test]
+    fn normalise_path_drops_dotdot_and_dot() {
+        // `..` must never let a member path escape the archive root.
+        assert_eq!(normalise_path("../../etc/passwd"), "/etc/passwd");
+        assert_eq!(normalise_path("a/../b"), "/b");
+        assert_eq!(normalise_path("./a/./b/"), "/a/b");
+        assert_eq!(normalise_path("/a/b/../../.."), "/");
+        assert_eq!(normalise_path(".."), "/");
+    }
+
+    fn test_meta() -> TarEntryMeta {
+        TarEntryMeta {
+            mode: 0o640,
+            uid: 1000,
+            gid: 1000,
+            mtime: 0x6000_0000,
+            uname: "user".into(),
+            gname: "group".into(),
+        }
+    }
+
+    /// Recompute the checksum of a hand-patched header block.
+    fn fix_checksum(block: &mut [u8; BLOCK_SIZE]) {
+        block[148..156].copy_from_slice(b"        ");
+        let sum: u32 = block.iter().map(|&b| b as u32).sum();
+        block[148..154].copy_from_slice(format!("{sum:06o}").as_bytes());
+        block[154] = 0;
+        block[155] = b' ';
+    }
+
+    /// A GNU base-256 size near `u64::MAX` used to make `data_off + size`
+    /// wrap, panicking (debug) or spinning the scan forever (release).
+    #[test]
+    fn scan_survives_base256_size_overflow() {
+        let mut block = build_header(
+            "/huge",
+            header::TYPEFLAG_REG,
+            0,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        // size field = base-256 with every payload bit set → u64::MAX.
+        block[124] = 0x80;
+        for b in &mut block[125..136] {
+            *b = 0xFF;
+        }
+        fix_checksum(&mut block);
+        let mut dev = MemoryBackend::new(4 * BLOCK_SIZE as u64);
+        dev.write_at(0, &block).unwrap();
+        let tar = Tar::open(&mut dev).unwrap();
+        // The entry is still reported (like any truncated final member);
+        // the scan then stops instead of wrapping around.
+        let entries = tar.entries(&mut dev).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, u64::MAX);
+    }
+
+    /// V7 archives mark directories with the old `\0` typeflag and a
+    /// trailing slash on the name.
+    #[test]
+    fn v7_trailing_slash_entry_is_a_directory() {
+        let mut h = build_header(
+            "sub/",
+            header::TYPEFLAG_REG_OLD,
+            0,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap();
+        h.name = "sub/".into();
+        let block = h.encode().unwrap();
+        let mut dev = MemoryBackend::new(4 * BLOCK_SIZE as u64);
+        dev.write_at(0, &block).unwrap();
+        let tar = Tar::open(&mut dev).unwrap();
+        let e = tar.lookup(&mut dev, "/sub").unwrap().unwrap();
+        assert_eq!(e.kind, EntryKind::Dir);
+
+        // Streaming reader agrees.
+        let mut bytes = block.to_vec();
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK_SIZE]);
+        let mut r = stream::TarStreamReader::new(&bytes[..]);
+        let ent = r.next_entry().unwrap().unwrap();
+        assert_eq!(ent.entry.kind, EntryKind::Dir);
+    }
+
+    /// Sizes past the 11-octal-digit ustar field go through a PAX `size`
+    /// record; the ustar header itself must still encode (with 0 in the
+    /// size field) rather than fail. Header-only: no 10 GiB body needed.
+    #[test]
+    fn header_for_ten_gib_file_encodes_with_pax_size() {
+        let size: u64 = 10 << 30;
+        assert!(!header::size_fits_ustar(size));
+        let h = build_header(
+            "/big.bin",
+            header::TYPEFLAG_REG,
+            size,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap();
+        let block = h.encode().unwrap();
+        assert!(Header::checksum_ok(&block));
+        assert_eq!(Header::decode(&block).unwrap().size, 0);
+        // The PAX record carries the real size and reads back as such.
+        let recs = vec![pax::Record {
+            key: pax::KEY_SIZE.into(),
+            value: size.to_string().into_bytes(),
+        }];
+        let mut over = PaxOverrides::default();
+        over.merge(pax::decode_records(&pax::encode_records(&recs)).unwrap());
+        assert_eq!(over.size, Some(size));
+        // 64 GiB (the old, wrong threshold) behaves the same way.
+        let h = build_header(
+            "/bigger.bin",
+            header::TYPEFLAG_REG,
+            64 << 30,
+            None,
+            (0, 0),
+            &test_meta(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(Header::decode(&h.encode().unwrap()).unwrap().size, 0);
+    }
+
+    #[test]
+    fn round_trip_minimal_archive() {
+        // Build a small archive in memory: one file with xattrs, one
+        // symlink, one nested file. Read it back and check the entries.
+        let mut dev = MemoryBackend::new(64 * 1024);
+        {
+            let mut w = TarWriter::new(&mut dev);
+            let meta = TarEntryMeta {
+                mode: 0o640,
+                uid: 1000,
+                gid: 1000,
+                mtime: 0x6000_0000,
+                uname: "user".into(),
+                gname: "group".into(),
+            };
+            let content = b"hello tar\n";
+            let mut r: &[u8] = content;
+            w.add_file(
+                "/hello.txt",
+                &mut r,
+                content.len() as u64,
+                meta.clone(),
+                &[Xattr::new("user.tag", b"flag".to_vec())],
+            )
+            .unwrap();
+            w.add_dir("/sub", meta.clone(), &[]).unwrap();
+            let nested = b"nested\n";
+            let mut nr: &[u8] = nested;
+            w.add_file(
+                "/sub/inside.txt",
+                &mut nr,
+                nested.len() as u64,
+                meta.clone(),
+                &[],
+            )
+            .unwrap();
+            w.add_symlink("/link-to-hello", "hello.txt", meta, &[])
+                .unwrap();
+            w.finish().unwrap();
+        }
+        let tar = Tar::open(&mut dev).unwrap();
+        let hello = tar.lookup(&mut dev, "/hello.txt").unwrap().unwrap();
+        assert_eq!(hello.kind, EntryKind::Regular);
+        assert_eq!(hello.mode, 0o640);
+        assert_eq!(hello.size, 10);
+        assert_eq!(hello.xattrs.len(), 1);
+        assert_eq!(hello.xattrs[0].name, "user.tag");
+        assert_eq!(hello.xattrs[0].value, b"flag");
+
+        let sym = tar.lookup(&mut dev, "/link-to-hello").unwrap().unwrap();
+        assert_eq!(sym.kind, EntryKind::Symlink);
+        assert_eq!(sym.link_target.as_deref(), Some("hello.txt"));
+
+        let nested = tar.lookup(&mut dev, "/sub/inside.txt").unwrap().unwrap();
+        let mut reader = tar.open_file_reader(&mut dev, "/sub/inside.txt").unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"nested\n");
+        assert_eq!(nested.size, 7);
+
+        let root = tar.list_path(&mut dev, "/").unwrap();
+        let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"hello.txt"));
+        assert!(names.contains(&"sub"));
+        assert!(names.contains(&"link-to-hello"));
+    }
+}

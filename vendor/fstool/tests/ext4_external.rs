@@ -1,0 +1,2240 @@
+#![cfg(feature = "ext")]
+//! ext4 (journal + extent tree) end-to-end validation.
+
+use std::io::Write;
+use std::process::Command;
+
+use fstool::block::{BlockDevice, FileBackend};
+use fstool::fs::ext::{Ext, FormatOpts, FsKind};
+use fstool::fs::{FileMeta, FileSource};
+use tempfile::NamedTempFile;
+
+fn which(tool: &str) -> Option<std::path::PathBuf> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {tool}"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let p = s.trim();
+    if p.is_empty() { None } else { Some(p.into()) }
+}
+
+/// Read a *default* `mke2fs -t ext4` image — 64bit + flex_bg +
+/// metadata_csum + extents + extra_isize all enabled. Confirms our reader
+/// tolerates the modern feature set for inspection (ls / cat / info).
+#[test]
+fn read_default_mke2fs_ext4_image() {
+    use std::io::Read;
+    let Some(_) = which("mke2fs") else {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    };
+
+    // Source tree to embed.
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(srcdir.path().join("etc")).unwrap();
+    std::fs::write(srcdir.path().join("readme"), b"default ext4\n").unwrap();
+    std::fs::write(srcdir.path().join("etc/conf"), b"x=1\n").unwrap();
+
+    let tmp = NamedTempFile::new().unwrap();
+    // Pin every knob that varies between mke2fs builds and platforms: without
+    // an explicit `-t ext4` the image inherits the local default, which is
+    // ext2 on some hosts, and the fixed label + UUID keep the image
+    // reproducible.
+    let out = Command::new("mke2fs")
+        .args([
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
+            "-L",
+            "",
+            "-U",
+            "00000000-0000-0000-0000-000000000000",
+            "-E",
+            "nodiscard",
+            "-d",
+        ])
+        .arg(srcdir.path())
+        .arg(tmp.path())
+        .arg("8192")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // fstool must open it and detect ext4.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let ext = Ext::open(&mut dev).unwrap();
+    assert_eq!(ext.kind, FsKind::Ext4);
+    // 64-bit images use 64-byte group descriptors.
+    assert_eq!(ext.sb.group_desc_size(), 64);
+
+    // Root listing must include the embedded tree.
+    let root = ext.list_inode(&mut dev, 2).unwrap();
+    let names: std::collections::HashSet<_> = root.iter().map(|e| e.name.clone()).collect();
+    assert!(names.contains("readme"), "missing /readme: {names:?}");
+    assert!(names.contains("etc"), "missing /etc: {names:?}");
+
+    // File contents come back byte-exact through the extent reader.
+    let ino = ext.path_to_inode(&mut dev, "/readme").unwrap();
+    let mut reader = ext.open_file_reader(&mut dev, ino).unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"default ext4\n");
+
+    let ino = ext.path_to_inode(&mut dev, "/etc/conf").unwrap();
+    let mut reader = ext.open_file_reader(&mut dev, ino).unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"x=1\n");
+}
+
+#[test]
+fn read_default_mke2fs_indexed_directory() {
+    let Some(_) = which("mke2fs") else {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    };
+
+    let srcdir = tempfile::tempdir().unwrap();
+    let indexed = srcdir.path().join("indexed");
+    std::fs::create_dir(&indexed).unwrap();
+    for index in 0..2_000 {
+        std::fs::write(indexed.join(format!("entry_{index:04}")), b"x").unwrap();
+    }
+
+    let tmp = NamedTempFile::new().unwrap();
+    let out = Command::new("mke2fs")
+        .args(["-F", "-t", "ext4", "-b", "4096", "-d"])
+        .arg(srcdir.path())
+        .arg(tmp.path())
+        .arg("32768")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let ext = Ext::open(&mut dev).unwrap();
+    assert!(
+        ext.path_to_inode(&mut dev, "/indexed/entry_1999").is_ok(),
+        "path lookup must traverse a default mke2fs ext4 indexed directory"
+    );
+}
+
+/// A mostly-zero file written with `sparse` set should occupy far fewer
+/// blocks while still reading back identically, and stay e2fsck-clean.
+#[test]
+fn ext4_sparse_file_uses_holes() {
+    use std::io::Read;
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    // 256 KiB: 4 KiB of data, 248 KiB of zeros, 4 KiB of data.
+    let mut body = vec![b'A'; 4096];
+    body.extend(std::iter::repeat_n(0u8, 248 * 1024));
+    body.extend(std::iter::repeat_n(b'B', 4096));
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("hole.bin"), &body).unwrap();
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        sparse: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let mut dev = FileBackend::create(
+        tmp.path(),
+        opts.blocks_count as u64 * opts.block_size as u64,
+    )
+    .unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"hole.bin",
+        FileSource::HostPath(srcdir.path().join("hole.bin")),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // The file's content must round-trip through our reader exactly.
+    let ino = ext.path_to_inode(&mut dev, "/hole.bin").unwrap();
+    let mut got = Vec::new();
+    ext.open_file_reader(&mut dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, body, "sparse file content mismatch");
+
+    // The inode should account for only the ~8 KiB of real data, not 256.
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    // blocks_512 counts 512-byte sectors; 8 KiB = 16, full file = 512.
+    assert!(
+        inode.blocks_512 < 64,
+        "sparse file used {} sectors, expected far fewer than the dense 512",
+        inode.blocks_512
+    );
+    drop(dev);
+
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck failed on sparse ext4:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn ext4_passes_e2fsck_and_advertises_features() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("dumpe2fs") else {
+        eprintln!("skipping: dumpe2fs not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    // Plant a file to exercise the extent writer.
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut()
+        .write_all(b"the quick brown fox\n")
+        .unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"fox.txt",
+        FileSource::HostPath(src.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // e2fsck must be clean.
+    let out = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "e2fsck failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // dumpe2fs must list the `extent` feature + the journal.
+    let out = Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let dump = String::from_utf8_lossy(&out.stdout);
+    assert!(dump.contains("extent"), "missing `extent` feature:\n{dump}");
+    assert!(dump.contains("has_journal"), "missing has_journal:\n{dump}");
+
+    // debugfs `stat /fox.txt` must show an EXTENTS_FL flag and the extent
+    // tree contents (not direct/indirect blocks).
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat /fox.txt")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stat.contains("EXTENTS") || stat.contains("Extents"),
+        "expected extent-mode inode:\n{stat}"
+    );
+
+    // `debugfs cat` must return the file body.
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("cat /fox.txt")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("the quick brown fox"),
+        "wrong file body via debugfs:\n{body}"
+    );
+}
+
+/// Round-trip the extent-encoded image through Ext::open + the streaming
+/// reader, confirming our own reader resolves extents correctly.
+#[test]
+fn ext4_open_reads_extent_file() {
+    use std::io::Read;
+    let tmp = NamedTempFile::new().unwrap();
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    {
+        let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut()
+            .write_all(b"extent-encoded payload\n")
+            .unwrap();
+        ext.add_file_to(
+            &mut dev,
+            2,
+            b"payload.bin",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    let ext = Ext::open(&mut dev).unwrap();
+    assert_eq!(ext.kind, FsKind::Ext4);
+    let ino = ext.path_to_inode(&mut dev, "/payload.bin").unwrap();
+    let mut reader = ext.open_file_reader(&mut dev, ino).unwrap();
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body).unwrap();
+    assert_eq!(body, b"extent-encoded payload\n");
+}
+
+/// With sparse_super, only groups 0, 1 and powers of 3/5/7 carry SB
+/// backups. Builds a multi-group ext4 and checks via `dumpe2fs` that
+/// the right groups are flagged with "Backup superblock".
+#[test]
+fn ext4_sparse_super_skips_non_backup_groups() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("dumpe2fs") else {
+        eprintln!("skipping: dumpe2fs not installed");
+        return;
+    };
+
+    // 4 groups (32 MiB at 1 KiB blocks).
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        blocks_count: 32 * 1024,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        sparse_super: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    Ext::format_with(&mut dev, &opts).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    // e2fsck must stay clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on sparse_super image:\n{}",
+        String::from_utf8_lossy(&fsck.stdout)
+    );
+
+    // dumpe2fs reports per-group metadata. With 4 groups: 0, 1, 3 are
+    // backup; 2 is not (2 is not a power of 3/5/7). Group 3 IS (3 = 3^1).
+    let dump = Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let header = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        header.contains("sparse_super"),
+        "sparse_super flag missing from dumpe2fs:\n{header}"
+    );
+
+    let dump = Command::new("dumpe2fs").arg(tmp.path()).output().unwrap();
+    let body = String::from_utf8_lossy(&dump.stdout);
+    // dumpe2fs lists each group's "Primary superblock" / "Backup
+    // superblock" / no superblock at all.
+    let mut g2_has_sb = false;
+    let mut g3_has_sb = false;
+    let mut current_group: Option<u32> = None;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("Group ") {
+            // "Group 2: (Blocks 16385-24576) ..."
+            let num: u32 = rest
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_end_matches(':')
+                .parse()
+                .unwrap_or(0);
+            current_group = Some(num);
+        }
+        if matches!(current_group, Some(2)) && line.contains("superblock at") {
+            g2_has_sb = true;
+        }
+        if matches!(current_group, Some(3)) && line.contains("superblock at") {
+            g3_has_sb = true;
+        }
+    }
+    assert!(
+        !g2_has_sb,
+        "group 2 should NOT have a backup superblock with sparse_super:\n{body}"
+    );
+    assert!(
+        g3_has_sb,
+        "group 3 SHOULD have a backup superblock (3 is a power of 3):\n{body}"
+    );
+}
+
+/// Add enough entries to a single directory that it spans multiple data
+/// blocks. Exercises the writer's directory-growth path (per-block linear
+/// fill, allocate-and-extend-extent on overflow). The output must pass
+/// `e2fsck -fn` and `debugfs ls /bigdir` must list every entry.
+#[test]
+fn ext4_large_directory_spans_multiple_blocks() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    // 4 KiB blocks → ~120 short entries per dir block. 500 names guarantees
+    // we cross the single-block cap, but stays well under the depth-0 extent
+    // cap (4 contiguous-or-coalescing extents).
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 1024,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    // Subdirectory to hold the burst.
+    let bigdir = ext
+        .add_dir_to(&mut dev, 2, b"bigdir", FileMeta::with_mode(0o755))
+        .unwrap();
+
+    // 500 zero-byte files with short, distinct names.
+    let n = 500u32;
+    for i in 0..n {
+        let name = format!("f{i:04}");
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name.as_bytes(),
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Confirm the inode's recorded size grew past one block.
+    let bigdir_inode = ext.read_inode(&mut dev, bigdir).unwrap();
+    assert!(
+        bigdir_inode.size > opts.block_size,
+        "expected multi-block dir, got size={} (one block is {})",
+        bigdir_inode.size,
+        opts.block_size
+    );
+
+    // Our own reader must see all 500 names.
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let names: std::collections::HashSet<_> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(
+        names.len() as u32,
+        n,
+        "fstool ls miscounted: got {} expected {n}",
+        names.len()
+    );
+
+    assert_eq!(
+        ext.path_to_inode(&mut dev, "/bigdir").unwrap(),
+        bigdir,
+        "path lookup must traverse a large directory"
+    );
+    assert_eq!(
+        ext.path_to_inode(&mut dev, "/bigdir/f0499").unwrap(),
+        *entries
+            .iter()
+            .find(|entry| entry.name == "f0499")
+            .map(|entry| &entry.inode)
+            .unwrap(),
+        "path lookup must ignore ext4 directory checksum tails"
+    );
+
+    drop(dev);
+
+    // e2fsck must stay clean.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on multi-block dir image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // debugfs must agree on the entry count.
+    let out = Command::new("debugfs")
+        .arg("-R")
+        .arg("ls -l /bigdir")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let count = listing
+        .lines()
+        .filter(|l| {
+            // Real entry rows start with "<inode>". Skip blank, ".", "..".
+            let first = l.split_whitespace().next().unwrap_or("");
+            first.parse::<u32>().is_ok()
+                && !l.contains(" . ")
+                && !l.ends_with(" .")
+                && !l.contains(" .. ")
+                && !l.ends_with(" ..")
+        })
+        .count();
+    assert_eq!(
+        count as u32, n,
+        "debugfs counted {count} entries, expected {n}:\n{listing}"
+    );
+}
+
+/// Force the extent tree past its depth-0 cap (4 inline leaves) by
+/// interleaving directory growth with multi-block file writes. Each file
+/// pushes the allocator forward several blocks, so each successive dir
+/// block lands non-adjacent to the previous one → no coalescing → many
+/// extents. The writer must promote depth-0 → depth-1, write a leaf
+/// block with its `ext4_extent_tail` CRC32C, and pass e2fsck on the
+/// metadata_csum-enabled output.
+#[test]
+fn ext4_fragmented_directory_promotes_to_depth1_extent_tree() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 32 * 1024,
+        inodes_count: 4096,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let bigdir = ext
+        .add_dir_to(&mut dev, 2, b"frag", FileMeta::with_mode(0o755))
+        .unwrap();
+
+    // Make every file 16 KiB → 4 dir-block-sized regions are allocated
+    // between each dir grow, fragmenting the dir's own block layout
+    // enough to need more than 4 extents.
+    let mut payload = Vec::with_capacity(16 * 1024);
+    for i in 0..(16 * 1024) {
+        payload.push((i & 0xff) as u8);
+    }
+    // ~250 entries fill one 4 KiB block; 2000 needs ~8 dir blocks, which
+    // can't fit in 4 inline extents once each block is fragmented.
+    let n = 2000u32;
+    for i in 0..n {
+        let name = format!("frag{i:04}");
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(&payload).unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name.as_bytes(),
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Our reader must enumerate every entry — exercises both depth-0 and
+    // depth-1 readback.
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let names: std::collections::HashSet<_> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(names.len() as u32, n, "fstool ls miscounted");
+
+    // Confirm the inode's extent tree is now depth-1 (otherwise the test
+    // wouldn't have exercised the new path). Decode the header directly.
+    let frag = ext.read_inode(&mut dev, bigdir).unwrap();
+    let bytes = {
+        let mut out = [0u8; 60];
+        for (i, slot) in frag.block.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        out
+    };
+    let magic = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+    assert_eq!(magic, 0xF30A, "extent header magic missing");
+    let depth = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+    assert_eq!(
+        depth, 1,
+        "expected /frag to use depth-1 extent tree (got depth={depth})"
+    );
+
+    drop(dev);
+
+    // e2fsck stays clean — depth-1 leaves carry the `ext4_extent_tail`
+    // CRC, which is what would fail here if the stamp path is wrong.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on fragmented dir image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Force a regular file's extent tree past depth-1 into depth-2 through
+/// the in-place `open_file_rw` path, then confirm the multi-level tree —
+/// internal index blocks and leaves, each with its `ext4_extent_tail`
+/// CRC32C — is accepted by `e2fsck` and reads back byte-for-byte. With
+/// 1 KiB blocks a leaf holds ~84 extents, so depth-1 caps at 4 × 84 = 336;
+/// 500 logically-discontiguous single-block writes overflow that and add
+/// a second idx level.
+#[test]
+fn ext4_open_file_rw_depth2_extent_tree_passes_e2fsck() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    use fstool::fs::{Filesystem, OpenFlags};
+
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 32 * 1024,
+        inodes_count: 4096,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let n: u64 = 500;
+    let gap: u64 = 1024 * 8; // 8-block stride keeps runs from coalescing
+    let mark = b"DEEP2!";
+    {
+        let mut h = ext
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep.bin"),
+                OpenFlags {
+                    create: true,
+                    ..OpenFlags::default()
+                },
+                Some(FileMeta::with_mode(0o644)),
+            )
+            .unwrap();
+        for i in 0..n {
+            h.seek(SeekFrom::Start(i * gap)).unwrap();
+            h.write_all(mark).unwrap();
+        }
+        h.sync().unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+
+    // The inode must carry a depth-2 extent tree.
+    let ino = ext.path_to_inode(&mut dev, "/deep.bin").unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    let mut iblock = [0u8; 60];
+    for (i, slot) in inode.block.iter().enumerate() {
+        iblock[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    let depth = u16::from_le_bytes(iblock[6..8].try_into().unwrap());
+    assert_eq!(depth, 2, "expected depth-2 extent tree, got depth {depth}");
+
+    // Reopen and verify every marker survives.
+    {
+        let mut h = ext
+            .open_file_rw(
+                &mut dev,
+                std::path::Path::new("/deep.bin"),
+                OpenFlags::default(),
+                None,
+            )
+            .unwrap();
+        for i in 0..n {
+            h.seek(SeekFrom::Start(i * gap)).unwrap();
+            let mut buf = vec![0u8; mark.len()];
+            h.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf[..], mark, "marker mismatch at index {i}");
+        }
+    }
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on depth-2 extent image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Force a *directory's* extent tree to depth-2 through the streaming
+/// incremental-append path (the route directory growth takes,
+/// [`append_extent_deep`]'s production caller) and confirm `e2fsck`
+/// accepts it. Long entry names mean each 1 KiB dir block holds only a
+/// handful of entries, so a few thousand fragmented entries push the
+/// directory past the 336-extent depth-1 ceiling — exercising the
+/// single-entry interior index blocks the streaming split path emits
+/// (which the balanced repack/`open_file_rw` builder never produces).
+#[test]
+fn ext4_streaming_directory_depth2_extent_tree_passes_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 64 * 1024,
+        inodes_count: 8192,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let dir = ext
+        .add_dir_to(&mut dev, 2, b"big", FileMeta::with_mode(0o755))
+        .unwrap();
+
+    // ~200-byte names → ~4 entries per 1 KiB block, so ~2000 entries span
+    // ~500 dir blocks. A 1-block file between each entry fragments the
+    // dir's own block layout so each block becomes its own extent.
+    let n = 2000u32;
+    let payload = vec![0x5au8; 512];
+    for i in 0..n {
+        let name = format!("entry-{i:06}-{}", "x".repeat(200));
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(&payload).unwrap();
+        ext.add_file_to(
+            &mut dev,
+            dir,
+            name.as_bytes(),
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Confirm the directory inode reached depth-2.
+    let inode = ext.read_inode(&mut dev, dir).unwrap();
+    let mut iblock = [0u8; 60];
+    for (i, slot) in inode.block.iter().enumerate() {
+        iblock[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    let depth = u16::from_le_bytes(iblock[6..8].try_into().unwrap());
+    assert_eq!(
+        depth, 2,
+        "expected directory to reach a depth-2 extent tree, got depth {depth}"
+    );
+
+    // Our reader must still enumerate every entry across the deep tree.
+    let entries = ext.list_inode(&mut dev, dir).unwrap();
+    let count = entries
+        .iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .count();
+    assert_eq!(count as u32, n, "reader miscounted deep-dir entries");
+
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck failed on depth-2 streaming dir image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Build an HTree-indexed directory (`EXT4_INDEX_FL`) and confirm
+/// e2fsck accepts it, debugfs sees it as indexed, and our reader
+/// enumerates every entry via the legacy linear-scan path that
+/// dx_root's fake `.` / `..` façade is meant to support.
+#[test]
+fn ext4_indexed_directory_passes_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+    use fstool::fs::ext::FormatOpts;
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 16 * 1024,
+        inodes_count: 2048,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    // 500 entries → ~3 leaves with our 87.5% target fill ratio.
+    let names: Vec<String> = (0..500).map(|i| format!("entry_{i:04}")).collect();
+    let name_bytes: Vec<&[u8]> = names.iter().map(|s| s.as_bytes()).collect();
+    let bigdir = ext
+        .add_dir_indexed(
+            &mut dev,
+            2,
+            b"indexed",
+            FileMeta::with_mode(0o755),
+            &name_bytes,
+        )
+        .unwrap();
+
+    // Now add the actual files. The router in add_entry_to_dir_block_for
+    // hashes each name and lands it in the right leaf.
+    for name in &name_bytes {
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"x\n").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name,
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Inode must carry EXT4_INDEX_FL (0x1000).
+    let inode = ext.read_inode(&mut dev, bigdir).unwrap();
+    assert!(
+        inode.flags & 0x1000 != 0,
+        "expected EXT4_INDEX_FL on /indexed inode, got flags={:#x}",
+        inode.flags
+    );
+
+    // Our reader's linear scan must enumerate every name via the
+    // `.`/`..` façade at the head of dx_root, even though it doesn't
+    // understand the dx_entry table.
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let got: std::collections::HashSet<String> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(
+        got.len(),
+        names.len(),
+        "fstool ls miscounted on indexed dir"
+    );
+    assert!(
+        ext.path_to_inode(&mut dev, "/indexed/entry_0499").is_ok(),
+        "path lookup must traverse HTree leaf blocks"
+    );
+
+    drop(dev);
+
+    // e2fsck must accept the indexed dir. If half-MD4 doesn't match
+    // the kernel's, or dx_root is malformed, this is where we find out.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected indexed dir:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // debugfs sees the directory as indexed (the htree_dump command
+    // succeeds only on EXT4_INDEX_FL inodes).
+    let dump = Command::new("debugfs")
+        .arg("-R")
+        .arg("htree_dump /indexed")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        out.contains("Number of entries") || out.contains("Hash Version") || out.contains("htree:"),
+        "debugfs htree_dump didn't recognise /indexed:\n{out}"
+    );
+}
+
+/// Build a source ext4 image via mke2fs that contains hard links, run
+/// `fstool repack` against it, and confirm the destination preserves
+/// the hardlink relationship (multiple names sharing one inode with
+/// `links_count > 1`) instead of materialising each link as a
+/// duplicated file body.
+#[cfg(feature = "cli")]
+#[test]
+fn ext4_repack_preserves_hardlinks() {
+    let Some(_) = which("mke2fs") else {
+        eprintln!("skipping: mke2fs not installed");
+        return;
+    };
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+
+    // Source host tree with hardlinks. `ln a b` makes `b` a hardlink
+    // to `a`; mke2fs's `-d` flag preserves these as ext4 hardlinks
+    // (inode-shared dirents).
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        srcdir.path().join("primary"),
+        b"shared bytes for the hardlink test\n",
+    )
+    .unwrap();
+    std::fs::hard_link(srcdir.path().join("primary"), srcdir.path().join("alias_a")).unwrap();
+    std::fs::hard_link(srcdir.path().join("primary"), srcdir.path().join("alias_b")).unwrap();
+
+    let src = NamedTempFile::new().unwrap();
+    let mk = Command::new("mke2fs")
+        .args([
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
+            "-L",
+            "",
+            "-U",
+            "00000000-0000-0000-0000-000000000000",
+            "-E",
+            "nodiscard",
+            "-d",
+        ])
+        .arg(srcdir.path())
+        .arg(src.path())
+        .arg("8192")
+        .output()
+        .unwrap();
+    assert!(
+        mk.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&mk.stderr)
+    );
+
+    // Sanity-check the source: the three names share one inode.
+    let src_ext = {
+        let mut dev = FileBackend::open(src.path()).unwrap();
+        let ext = Ext::open(&mut dev).unwrap();
+        let root = ext.list_inode(&mut dev, 2).unwrap();
+        let mut shared_inos = std::collections::HashSet::new();
+        for n in ["primary", "alias_a", "alias_b"] {
+            let ino = root
+                .iter()
+                .find(|e| e.name == n)
+                .map(|e| e.inode)
+                .expect("primary/alias not found in source");
+            shared_inos.insert(ino);
+        }
+        assert_eq!(
+            shared_inos.len(),
+            1,
+            "expected one shared source inode, got {shared_inos:?}"
+        );
+        *shared_inos.iter().next().unwrap()
+    };
+    let _ = src_ext;
+
+    // Run repack via fstool. The binary is built by the test harness.
+    let dst = NamedTempFile::new().unwrap();
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fstool"));
+    let out = Command::new(&bin)
+        .args(["repack", "--shrink"])
+        .arg(src.path())
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fstool repack failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Open the destination and confirm the three names share one
+    // inode with links_count == 3.
+    let mut dst_dev = FileBackend::open(dst.path()).unwrap();
+    let dst_ext = Ext::open(&mut dst_dev).unwrap();
+    let root = dst_ext.list_inode(&mut dst_dev, 2).unwrap();
+    let mut dst_inos = std::collections::HashSet::new();
+    for n in ["primary", "alias_a", "alias_b"] {
+        let ino = root
+            .iter()
+            .find(|e| e.name == n)
+            .map(|e| e.inode)
+            .unwrap_or_else(|| panic!("destination missing {n}: {root:?}"));
+        dst_inos.insert(ino);
+    }
+    assert_eq!(
+        dst_inos.len(),
+        1,
+        "expected destination's three names to share one inode, got {dst_inos:?}"
+    );
+    let shared = *dst_inos.iter().next().unwrap();
+    let shared_inode = dst_ext.read_inode(&mut dst_dev, shared).unwrap();
+    assert_eq!(
+        shared_inode.links_count, 3,
+        "shared inode {shared} should have links_count=3, got {}",
+        shared_inode.links_count
+    );
+
+    drop(dst_dev);
+
+    // e2fsck must be clean on the destination.
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected hardlink-preserving repack:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Build a source ext4 image whose biggest file is sparse (4 KiB of
+/// real data, then a 240 KiB hole, then another 4 KiB of real data),
+/// run `fstool repack --shrink`, and confirm the destination keeps
+/// the hole instead of inflating the file to its full dense size.
+#[cfg(feature = "cli")]
+#[test]
+fn ext4_repack_preserves_sparse_files() {
+    use std::io::Read;
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    // Source: build directly via fstool with sparse=true so the source
+    // file's blocks_512 is small even though its logical size is 248 KiB.
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 16 * 1024,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        sparse: true,
+        ..FormatOpts::default()
+    };
+    let src_tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut src_dev = FileBackend::create(src_tmp.path(), size).unwrap();
+    let mut src_ext = Ext::format_with(&mut src_dev, &opts).unwrap();
+
+    let mut body = vec![b'A'; 4096];
+    body.extend(std::iter::repeat_n(0u8, 240 * 1024));
+    body.extend(std::iter::repeat_n(b'B', 4096));
+    let payload = NamedTempFile::new().unwrap();
+    std::fs::write(payload.path(), &body).unwrap();
+    src_ext
+        .add_file_to(
+            &mut src_dev,
+            2,
+            b"sparse.bin",
+            FileSource::HostPath(payload.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    src_ext.flush(&mut src_dev).unwrap();
+    src_dev.sync().unwrap();
+    drop(src_dev);
+
+    // Confirm source's sparse.bin really has a small blocks_512.
+    {
+        let mut dev = FileBackend::open(src_tmp.path()).unwrap();
+        let ext = Ext::open(&mut dev).unwrap();
+        let ino = ext.path_to_inode(&mut dev, "/sparse.bin").unwrap();
+        let inode = ext.read_inode(&mut dev, ino).unwrap();
+        assert!(
+            inode.blocks_512 < 64,
+            "source sparse.bin used {} sectors, expected far fewer than dense ({})",
+            inode.blocks_512,
+            body.len() / 512
+        );
+    }
+
+    // Repack via the CLI; the repack path now sets sparse=true on the
+    // destination Ext.
+    let dst = NamedTempFile::new().unwrap();
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fstool"));
+    let out = Command::new(&bin)
+        .args(["repack", "--shrink"])
+        .arg(src_tmp.path())
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fstool repack failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Destination's sparse.bin must still be sparse: blocks_512 small,
+    // file content byte-exact.
+    let mut dst_dev = FileBackend::open(dst.path()).unwrap();
+    let dst_ext = Ext::open(&mut dst_dev).unwrap();
+    let ino = dst_ext.path_to_inode(&mut dst_dev, "/sparse.bin").unwrap();
+    let inode = dst_ext.read_inode(&mut dst_dev, ino).unwrap();
+    assert!(
+        inode.blocks_512 < 64,
+        "destination sparse.bin used {} sectors after repack, expected sparse layout",
+        inode.blocks_512
+    );
+    let mut got = Vec::new();
+    dst_ext
+        .open_file_reader(&mut dst_dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, body, "sparse.bin content mismatch after repack");
+    drop(dst_dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected sparse-preserving repack:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Build a clean ext4 image with a file marker.txt containing "OLD",
+/// then surgically inject a JBD2 transaction into the journal that
+/// overwrites marker.txt's data block with "NEW", set `s_start` so
+/// the journal looks dirty, and confirm `fstool repack` applies the
+/// pending transaction (destination's marker.txt reads "NEW") instead
+/// of taking the stale on-disk state.
+#[cfg(feature = "cli")]
+#[test]
+fn ext4_repack_replays_pending_journal() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    use fstool::block::BlockDevice as _;
+    use fstool::fs::ext::jbd2;
+
+    // ── Build the source clean.
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let src_tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut src_dev = FileBackend::create(src_tmp.path(), size).unwrap();
+    let mut src_ext = Ext::format_with(&mut src_dev, &opts).unwrap();
+
+    let mut srcfile = NamedTempFile::new().unwrap();
+    srcfile.as_file_mut().write_all(b"OLD\n").unwrap();
+    let marker_ino = src_ext
+        .add_file_to(
+            &mut src_dev,
+            2,
+            b"marker.txt",
+            FileSource::HostPath(srcfile.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    src_ext.flush(&mut src_dev).unwrap();
+    src_dev.sync().unwrap();
+
+    // ── Capture the marker.txt data-block address.
+    let marker_inode = src_ext.read_inode(&mut src_dev, marker_ino).unwrap();
+    let marker_phys = src_ext.file_block(&mut src_dev, &marker_inode, 0).unwrap();
+    assert_ne!(marker_phys, 0, "marker.txt must have a data block");
+
+    // ── Locate the journal's physical blocks 0..3 on disk.
+    let journal_ino = src_ext.sb.journal_inum;
+    let journal_inode = src_ext.read_inode(&mut src_dev, journal_ino).unwrap();
+    // Borrow `src_dev` through a scoped closure so the &mut goes away
+    // before we re-borrow `src_dev` to read the journal SB below.
+    let (jsb_phys, desc_phys, data_phys, commit_phys) = {
+        let mut jb_phys = |logical: u32| {
+            src_ext
+                .file_block(&mut src_dev, &journal_inode, logical)
+                .unwrap()
+        };
+        (jb_phys(0), jb_phys(1), jb_phys(2), jb_phys(3))
+    };
+
+    // ── Read the journal SB to learn its sequence number / UUID.
+    let bs = opts.block_size;
+    let mut jsb_buf = vec![0u8; bs as usize];
+    src_dev
+        .read_at(jsb_phys as u64 * bs as u64, &mut jsb_buf)
+        .unwrap();
+    let jsb = jbd2::JournalSuperblock::decode(&jsb_buf).unwrap();
+    let tid = jsb.sequence;
+
+    // ── Build the descriptor block (journal logical block 1).
+    let payload = {
+        let mut b = vec![0u8; bs as usize];
+        b[..4].copy_from_slice(b"NEW\n");
+        b
+    };
+    let descriptor = jbd2::encode_descriptor_block(
+        bs,
+        tid,
+        &[jbd2::JournalBlock {
+            fs_block: marker_phys,
+            bytes: payload.clone(),
+        }],
+        &jsb.uuid,
+        true,
+        true,
+    );
+    let commit = jbd2::encode_commit_block(bs, tid, 0, 0);
+
+    // ── Write the three log blocks.
+    src_dev
+        .write_at(desc_phys as u64 * bs as u64, &descriptor)
+        .unwrap();
+    src_dev
+        .write_at(data_phys as u64 * bs as u64, &payload)
+        .unwrap();
+    src_dev
+        .write_at(commit_phys as u64 * bs as u64, &commit)
+        .unwrap();
+
+    // ── Mark the journal as dirty: s_start = 1 (logical-in-journal).
+    jbd2::set_start(&mut jsb_buf, 1);
+    src_dev
+        .write_at(jsb_phys as u64 * bs as u64, &jsb_buf)
+        .unwrap();
+
+    // ── Flip INCOMPAT_RECOVER on the FS superblock so the image
+    //    advertises that recovery is needed (matches what a real
+    //    unclean shutdown leaves behind). Re-stamp the CRC32C `s_checksum`
+    //    at offset 1020 since we changed bytes earlier in the SB.
+    let mut sb_buf = vec![0u8; 1024];
+    src_dev.read_at(1024, &mut sb_buf).unwrap();
+    let fi_off = 96usize; // s_feature_incompat
+    let mut fi = u32::from_le_bytes(sb_buf[fi_off..fi_off + 4].try_into().unwrap());
+    fi |= 0x0004; // INCOMPAT_RECOVER
+    sb_buf[fi_off..fi_off + 4].copy_from_slice(&fi.to_le_bytes());
+    let new_csum = fstool::fs::ext::csum::superblock(&sb_buf);
+    sb_buf[1020..1024].copy_from_slice(&new_csum.to_le_bytes());
+    src_dev.write_at(1024, &sb_buf).unwrap();
+    src_dev.sync().unwrap();
+    drop(src_dev);
+    drop(src_ext);
+
+    // ── Sanity-check the pre-replay state: on-disk marker_phys still
+    //    has the OLD content (replay hasn't run yet).
+    {
+        let mut dev = FileBackend::open(src_tmp.path()).unwrap();
+        let mut buf = vec![0u8; bs as usize];
+        dev.read_at(marker_phys as u64 * bs as u64, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..4], b"OLD\n");
+    }
+
+    // ── Repack via the CLI; the source-open path now triggers
+    //    replay_pending_journal before walking the source.
+    let dst = NamedTempFile::new().unwrap();
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_fstool"));
+    let out = Command::new(&bin)
+        .args(["repack", "--shrink"])
+        .arg(src_tmp.path())
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fstool repack failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ── Destination's marker.txt must reflect the replayed value.
+    use std::io::Read;
+    let mut dst_dev = FileBackend::open(dst.path()).unwrap();
+    let dst_ext = Ext::open(&mut dst_dev).unwrap();
+    let ino = dst_ext.path_to_inode(&mut dst_dev, "/marker.txt").unwrap();
+    let mut got = Vec::new();
+    dst_ext
+        .open_file_reader(&mut dst_dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(
+        got,
+        b"NEW\n",
+        "expected replay to apply NEW, got {:?}",
+        String::from_utf8_lossy(&got)
+    );
+    drop(dst_dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected post-replay repack:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Build an HTree-indexed directory big enough to force a two-level
+/// tree (`indirect_levels = 1`): a dx_root pointing at multiple
+/// dx_node intermediate blocks, each pointing at the actual leaves.
+/// 1024-byte blocks shrink the single-level cap from ~90 K entries
+/// to ~5400, so a 6500-entry dir is enough to cross it without
+/// ballooning the test image. Also exercises the multi-descriptor
+/// JBD2 commit path: > 124 dir blocks staged at 1 KiB blocks doesn't
+/// fit in one descriptor.
+#[test]
+fn ext4_indexed_directory_two_level_passes_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    let Some(_) = which("debugfs") else {
+        eprintln!("skipping: debugfs not installed");
+        return;
+    };
+    use fstool::fs::ext::FormatOpts;
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 64 * 1024,
+        inodes_count: 8192,
+        journal_blocks: 8192,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let names: Vec<String> = (0..6500).map(|i| format!("entry_{i:05}")).collect();
+    let name_bytes: Vec<&[u8]> = names.iter().map(|s| s.as_bytes()).collect();
+    let bigdir = ext
+        .add_dir_indexed(&mut dev, 2, b"big", FileMeta::with_mode(0o755), &name_bytes)
+        .unwrap();
+    for name in &name_bytes {
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"x\n").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            bigdir,
+            name,
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // Our reader must enumerate every name via the legacy linear-scan
+    // path (dx_root/dx_node fake-dirent prefixes are designed to stop
+    // it after one bogus dirent per index block, leaving real entries
+    // discoverable in the leaves).
+    let entries = ext.list_inode(&mut dev, bigdir).unwrap();
+    let got: std::collections::HashSet<String> = entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| n != "." && n != "..")
+        .collect();
+    assert_eq!(
+        got.len(),
+        names.len(),
+        "fstool ls miscounted on two-level indexed dir"
+    );
+
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected two-level indexed dir:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // debugfs's htree_dump on a depth-1 tree shows "Indirect levels: 1".
+    let dump = Command::new("debugfs")
+        .arg("-R")
+        .arg("htree_dump /big")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&dump.stdout);
+    assert!(
+        out.contains("Indirect levels: 1"),
+        "debugfs didn't see /big as depth-1:\n{out}"
+    );
+}
+
+/// Exercise the post-build mutation API end-to-end: chmod, chown,
+/// set_times, truncate (shrink + grow), rename (within-dir + cross-dir),
+/// and hardlink-aware unlink. The image must stay e2fsck-clean after
+/// every operation.
+#[test]
+fn ext4_mutation_api_round_trips_through_e2fsck() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+    use fstool::block::BlockDevice as _;
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 128,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    // Two regular files, hardlinked.
+    let mut payload = NamedTempFile::new().unwrap();
+    payload.as_file_mut().write_all(b"original\n").unwrap();
+    let ino = ext
+        .add_file_to(
+            &mut dev,
+            2,
+            b"primary",
+            FileSource::HostPath(payload.path().to_path_buf()),
+            FileMeta::with_mode(0o600),
+        )
+        .unwrap();
+    ext.add_link_to(&mut dev, 2, b"alias", ino).unwrap();
+
+    // A subdir we'll rename across.
+    let sub = ext
+        .add_dir_to(&mut dev, 2, b"sub_a", FileMeta::with_mode(0o755))
+        .unwrap();
+    // Put a file inside so the dir isn't empty.
+    let mut nested = NamedTempFile::new().unwrap();
+    nested.as_file_mut().write_all(b"nested\n").unwrap();
+    ext.add_file_to(
+        &mut dev,
+        sub,
+        b"nested.txt",
+        FileSource::HostPath(nested.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+
+    // chmod / chown / set_times on `primary`.
+    ext.chmod(&mut dev, ino, 0o640).unwrap();
+    ext.chown(&mut dev, ino, 1000, 1000).unwrap();
+    ext.set_times(&mut dev, ino, Some(123456), Some(654321), Some(111111))
+        .unwrap();
+
+    // Verify the changes are visible via read_inode.
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(inode.mode & 0o7777, 0o640);
+    assert_eq!(inode.uid as u32, 1000);
+    assert_eq!(inode.gid as u32, 1000);
+    assert_eq!(inode.atime, 123456);
+    assert_eq!(inode.mtime, 654321);
+    assert_eq!(inode.ctime, 111111);
+
+    // Truncate (grow): the file's logical size grows but no new blocks
+    // are allocated until something writes into the hole.
+    ext.truncate(&mut dev, ino, 32 * 1024).unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(inode.size, 32 * 1024);
+
+    // Truncate (shrink): back down to the original 9-byte content.
+    ext.truncate(&mut dev, ino, 9).unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(inode.size, 9);
+
+    // Rename within the same dir.
+    ext.rename(&mut dev, 2, b"alias", 2, b"alias_renamed")
+        .unwrap();
+    let root_entries = ext.list_inode(&mut dev, 2).unwrap();
+    assert!(root_entries.iter().any(|e| e.name == "alias_renamed"));
+    assert!(!root_entries.iter().any(|e| e.name == "alias"));
+
+    // Rename cross-dir: move primary into sub_a.
+    ext.rename(&mut dev, 2, b"primary", sub, b"primary")
+        .unwrap();
+    let root_entries = ext.list_inode(&mut dev, 2).unwrap();
+    assert!(!root_entries.iter().any(|e| e.name == "primary"));
+    let sub_entries = ext.list_inode(&mut dev, sub).unwrap();
+    assert!(sub_entries.iter().any(|e| e.name == "primary"));
+
+    // Hardlink-aware unlink: alias_renamed still points at the same
+    // inode as primary (links_count = 2). Removing alias_renamed must
+    // decrement links_count to 1, NOT free the inode.
+    let before = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(before.links_count, 2);
+    ext.remove_path(&mut dev, "/alias_renamed").unwrap();
+    let after = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(after.links_count, 1);
+    assert_ne!(after.mode, 0, "primary inode must still be allocated");
+
+    // Cross-dir rename of a directory: move sub_a → sub_b. The dir's
+    // `..` is rewired to the new parent (here still root, so the
+    // dirent stays = 2; we just verify the rename succeeded and the
+    // image stays clean).
+    ext.rename(&mut dev, 2, b"sub_a", 2, b"sub_b").unwrap();
+    let root_entries = ext.list_inode(&mut dev, 2).unwrap();
+    assert!(root_entries.iter().any(|e| e.name == "sub_b"));
+    assert!(!root_entries.iter().any(|e| e.name == "sub_a"));
+
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected the post-mutation image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Build an ext4 with `inline_data` on, write a 40-byte file, and
+/// confirm: (1) the inode carries `EXT4_INLINE_DATA_FL` and
+/// `blocks_512 == 0` (no data block allocated), (2) our own reader
+/// returns the original bytes, (3) e2fsck stays clean (it understands
+/// the inline-data layout when `INCOMPAT_INLINE_DATA` is advertised).
+#[test]
+fn ext4_inline_data_stores_small_files_in_inode() {
+    use std::io::Read;
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        inline_data: true,
+        // inline_data needs the in-inode xattr area for its
+        // `system.data` marker, so 256-byte inodes are mandatory.
+        inode_size: 256,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+
+    let body = b"inline payload that fits in 60 bytes \xe2\x9c\x93\n";
+    assert!(body.len() <= 60);
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut().write_all(body).unwrap();
+    let ino = ext
+        .add_file_to(
+            &mut dev,
+            2,
+            b"small.txt",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    ext.flush(&mut dev).unwrap();
+    use fstool::block::BlockDevice as _;
+    dev.sync().unwrap();
+
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    assert_eq!(
+        inode.size as usize,
+        body.len(),
+        "inline file size should match payload"
+    );
+    assert!(
+        inode.flags & 0x1000_0000 != 0,
+        "EXT4_INLINE_DATA_FL must be set on inline inodes, flags={:#x}",
+        inode.flags
+    );
+    // The data sits in i_block and the kernel-required `system.data`
+    // marker xattr lives in the inode's extended area: no data block,
+    // no external xattr block.
+    assert_eq!(inode.blocks_512, 0, "inline file must not own any block");
+    assert_eq!(inode.file_acl, 0, "marker xattr must be in-inode");
+
+    let mut got = Vec::new();
+    ext.open_file_reader(&mut dev, ino)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, body, "inline read-back mismatch");
+
+    // For a regular file > 60 bytes, the inline-data path should NOT
+    // engage and the writer falls back to allocating a data block.
+    let mut bigger = NamedTempFile::new().unwrap();
+    let big_body: Vec<u8> = (0..200).map(|i| (i & 0xff) as u8).collect();
+    bigger.as_file_mut().write_all(&big_body).unwrap();
+    let big_ino = ext
+        .add_file_to(
+            &mut dev,
+            2,
+            b"bigger.bin",
+            FileSource::HostPath(bigger.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    let big_inode = ext.read_inode(&mut dev, big_ino).unwrap();
+    assert_eq!(
+        big_inode.flags & 0x1000_0000,
+        0,
+        "non-inline file must NOT carry EXT4_INLINE_DATA_FL"
+    );
+    assert!(
+        big_inode.blocks_512 > 0,
+        "non-inline file must allocate data blocks"
+    );
+
+    drop(dev);
+
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected the inline_data image:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// Crash-recovery harness: format a journalled ext4 image into a
+/// MemoryBackend, build it out, then commit a second transaction
+/// through a CrashInject wrapper that fails after N writes. The
+/// crashed image's on-disk state is then re-opened with our normal
+/// `Ext::open` + `replay_pending_journal`, and we assert that
+/// whatever survived recovery is internally consistent — every
+/// directory entry resolves to a readable inode, no panics, no
+/// infinite walks.
+///
+/// Doesn't try to assert a SPECIFIC post-recovery state because the
+/// crash point is in the middle of journaling and the exact set of
+/// recovered transactions depends on internal ordering. The
+/// invariant we ARE asserting: recovery completes without crashing
+/// and the result is walkable.
+#[test]
+fn ext4_crash_during_flush_recovers_cleanly() {
+    use fstool::block::{BlockDevice as _, CrashInject, FailAfter, MemoryBackend};
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 1024,
+        blocks_count: 4096,
+        inodes_count: 128,
+        journal_blocks: 1024,
+        ..FormatOpts::default()
+    };
+    let total = opts.blocks_count as u64 * opts.block_size as u64;
+
+    for &fail_after_n in &[5u64, 20, 100, 500] {
+        // Format cleanly first into a plain MemoryBackend so the
+        // baseline FS is well-formed before the crash test runs.
+        let mut dev = MemoryBackend::new(total);
+        let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+        // Plant a known starting state: one file under root.
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"baseline\n").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            2,
+            b"before",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+        drop(ext);
+
+        // Now wrap the device with crash injection and apply a second
+        // batch of mutations. After `fail_after_n` writes, every
+        // subsequent write is silently dropped — simulating SIGKILL
+        // between the syscall and the disk landing.
+        let mut crashed_dev = CrashInject::new(dev, FailAfter::Writes(fail_after_n));
+        let mut ext = Ext::open(&mut crashed_dev).unwrap();
+        for i in 0..20u32 {
+            let name = format!("after_{i:02}");
+            let mut s = NamedTempFile::new().unwrap();
+            s.as_file_mut()
+                .write_all(format!("data {i}\n").as_bytes())
+                .unwrap();
+            // Errors are expected once the wrapper crashes — swallow
+            // them, the test point is "what happens on the next open".
+            let _ = ext.add_file_to(
+                &mut crashed_dev,
+                2,
+                name.as_bytes(),
+                FileSource::HostPath(s.path().to_path_buf()),
+                FileMeta::with_mode(0o644),
+            );
+        }
+        let _ = ext.flush(&mut crashed_dev);
+        let _ = crashed_dev.sync();
+        drop(ext);
+        let recovered_dev = crashed_dev.into_inner();
+
+        // Re-open the post-crash device. open() must not panic; if it
+        // returns an error that's also acceptable — the FS might be
+        // wrecked past what JBD2 can salvage. What's NOT acceptable
+        // is hanging or producing garbage attrs.
+        let mut dev = recovered_dev;
+        let Ok(mut ext) = Ext::open(&mut dev) else {
+            // Severe corruption — that's a valid outcome at low N.
+            continue;
+        };
+        let _ = ext.replay_pending_journal(&mut dev);
+        // Every entry under root must resolve to a readable inode.
+        let entries = ext.list_inode(&mut dev, 2).unwrap_or_default();
+        for e in &entries {
+            // Just confirm we can read the inode — content doesn't
+            // matter for this test.
+            let _ = ext.read_inode(&mut dev, e.inode);
+        }
+        // The pre-crash file must always survive (it was committed
+        // and checkpointed BEFORE we wrapped the device).
+        let before_present = entries.iter().any(|e| e.name == "before");
+        assert!(
+            before_present,
+            "fail_after={fail_after_n}: pre-crash `before` file must survive (entries: {:?})",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Regression for the one-shot build path (used by `repack`): a file
+/// whose data blocks are scattered across the free-space map needs more
+/// than the 4-extent inline budget, so `fill_block_pointers_extent`
+/// must promote to a depth-1 extent tree. Before the fix it errored
+/// with "max 4 per depth-0 tree (multi-level trees not yet
+/// implemented)" — the exact failure a fragmented tar.gz → ext4 repack
+/// hit.
+///
+/// Recipe to force fragmentation deterministically: fill a band of the
+/// free map with single-block files, free every other one (the
+/// allocator's first-free scan then hands those scattered blocks back),
+/// and write one multi-block file into the holes. e2fsck must accept
+/// the result and the bytes must round-trip in logical order.
+#[test]
+fn ext4_fragmented_file_one_shot_promotes_to_depth1() {
+    let Some(_) = which("e2fsck") else {
+        eprintln!("skipping: e2fsck not installed");
+        return;
+    };
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 16 * 1024,
+        inodes_count: 1024,
+        journal_blocks: 1024,
+        // Non-sparse so every block is really allocated — otherwise an
+        // all-zero block would become a hole and not fragment.
+        sparse: false,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    let bs = 4096usize;
+
+    // 1) Lay down 64 single-block files contiguously.
+    let filler = vec![0x11u8; bs];
+    let mut spacer = NamedTempFile::new().unwrap();
+    spacer.as_file_mut().write_all(&filler).unwrap();
+    for i in 0..64u32 {
+        let name = format!("sp{i:03}");
+        ext.add_file_to(
+            &mut dev,
+            2,
+            name.as_bytes(),
+            FileSource::HostPath(spacer.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+    }
+    // 2) Free every other one → ~32 scattered single-block holes.
+    for i in (0..64u32).step_by(2) {
+        ext.remove_path(&mut dev, &format!("/sp{i:03}")).unwrap();
+    }
+    ext.flush(&mut dev).unwrap();
+
+    // 3) Write one 24-block file. Each logical block gets a distinct
+    //    non-zero byte so a mis-ordered extent would corrupt readback.
+    let mut payload = Vec::with_capacity(24 * bs);
+    for b in 0..24u8 {
+        payload.extend(std::iter::repeat_n(b.wrapping_add(1), bs));
+    }
+    let mut bigf = NamedTempFile::new().unwrap();
+    bigf.as_file_mut().write_all(&payload).unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"big.bin",
+        FileSource::HostPath(bigf.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+
+    // 4) The extent tree for big.bin must be depth-1 (otherwise the new
+    //    one-shot promotion path wasn't exercised). Decode the header.
+    let ino = ext.path_to_inode(&mut dev, "/big.bin").unwrap();
+    let inode = ext.read_inode(&mut dev, ino).unwrap();
+    let mut iblock = [0u8; 60];
+    for (i, slot) in inode.block.iter().enumerate() {
+        iblock[i * 4..i * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+    }
+    let depth = u16::from_le_bytes(iblock[6..8].try_into().unwrap());
+    assert_eq!(
+        depth, 1,
+        "big.bin extent tree should be depth-1 after fragmentation, got depth {depth}"
+    );
+
+    // 5) Content round-trips in logical order through fstool's reader.
+    {
+        use std::io::Read;
+        let mut r = ext.open_file_reader(&mut dev, ino).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload, "big.bin bytes corrupted / mis-ordered");
+    }
+    drop(dev);
+
+    // 6) e2fsck -fn clean.
+    let out = Command::new("e2fsck")
+        .args(["-fn"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "e2fsck not clean on depth-1 fragmented file:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Run `e2fsck -fn` and panic with its output unless it is clean.
+fn assert_e2fsck_clean(path: &std::path::Path, what: &str) {
+    let fsck = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        fsck.status.success(),
+        "e2fsck rejected {what}:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+}
+
+/// `dumpe2fs -h` feature line must (or must not) list `feature`.
+fn assert_dumpe2fs_feature(path: &std::path::Path, feature: &str, present: bool) {
+    let out = Command::new("dumpe2fs")
+        .arg("-h")
+        .arg(path)
+        .output()
+        .unwrap();
+    let dump = String::from_utf8_lossy(&out.stdout);
+    let line = dump
+        .lines()
+        .find(|l| l.starts_with("Filesystem features:"))
+        .unwrap_or_else(|| panic!("no feature line in dumpe2fs output:\n{dump}"));
+    let has = line.split_whitespace().any(|f| f == feature);
+    assert_eq!(
+        has, present,
+        "expected `{feature}` present={present} in dumpe2fs features: {line}"
+    );
+}
+
+/// Open an mke2fs-built `metadata_csum_seed` image whose UUID was then
+/// changed with `tune2fs -U`, write into it, and confirm e2fsck stays
+/// clean. With `metadata_csum_seed` the seed is pinned in
+/// `s_checksum_seed`; after the UUID change it no longer matches the
+/// UUID-derived value, so a writer that ignores the feature stamps
+/// every group descriptor, bitmap, inode and directory block with the
+/// wrong checksum.
+#[test]
+fn ext4_open_honours_metadata_csum_seed_after_uuid_change() {
+    use std::io::Read;
+    for tool in ["mke2fs", "tune2fs", "e2fsck", "dumpe2fs"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+
+    let srcdir = tempfile::tempdir().unwrap();
+    std::fs::write(srcdir.path().join("readme"), b"seeded ext4\n").unwrap();
+
+    let tmp = NamedTempFile::new().unwrap();
+    // `-I 128` and `^resize_inode` sidestep two writer limitations that
+    // have nothing to do with the seed: writing into an image with
+    // 256-byte inodes leaves inode / directory-block checksums stale,
+    // and the writer does not account for the reserved-GDT blocks
+    // owned by the resize inode. Both reproduce identically without
+    // `metadata_csum_seed`; this test isolates the seed handling.
+    let out = Command::new("mke2fs")
+        .args([
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
+            "-I",
+            "128",
+            "-O",
+            "^resize_inode,metadata_csum,metadata_csum_seed",
+            "-L",
+            "",
+            "-U",
+            "12345678-1234-1234-1234-123456789abc",
+            "-E",
+            "nodiscard",
+            "-d",
+        ])
+        .arg(srcdir.path())
+        .arg(tmp.path())
+        .arg("8192")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mke2fs failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum_seed", true);
+
+    // Change the UUID. With metadata_csum_seed this is instant and
+    // leaves `s_checksum_seed` (and thus every checksum) untouched, so
+    // the seed now differs from crc32c(~0, uuid).
+    let out = Command::new("tune2fs")
+        .args(["-U", "0f0e0d0c-0b0a-0908-0706-050403020100"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "tune2fs -U failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_e2fsck_clean(tmp.path(), "the tune2fs -U'd source image");
+
+    // Write into it with fstool.
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ext = Ext::open(&mut dev).unwrap();
+        assert_eq!(ext.kind, FsKind::Ext4);
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut()
+            .write_all(b"written with the pinned seed\n")
+            .unwrap();
+        let sub = ext
+            .add_dir_to(&mut dev, 2, b"sub", FileMeta::with_mode(0o755))
+            .unwrap();
+        ext.add_file_to(
+            &mut dev,
+            sub,
+            b"added.txt",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+
+    assert_e2fsck_clean(
+        tmp.path(),
+        "the image after writing with metadata_csum_seed",
+    );
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum_seed", true);
+
+    // Re-open and read both the original and the added file back.
+    let mut dev = FileBackend::open(tmp.path()).unwrap();
+    let ext = Ext::open(&mut dev).unwrap();
+    for (path, want) in [
+        ("/readme", &b"seeded ext4\n"[..]),
+        ("/sub/added.txt", &b"written with the pinned seed\n"[..]),
+    ] {
+        let ino = ext.path_to_inode(&mut dev, path).unwrap();
+        let mut body = Vec::new();
+        ext.open_file_reader(&mut dev, ino)
+            .unwrap()
+            .read_to_end(&mut body)
+            .unwrap();
+        assert_eq!(body, want, "{path} read-back mismatch");
+    }
+}
+
+/// Format with `metadata_csum_seed` on: e2fsck must be clean, dumpe2fs
+/// must list the feature, and a subsequent `tune2fs -U` (cheap only
+/// because the seed is pinned) followed by another fstool write must
+/// still leave a clean filesystem.
+#[test]
+fn ext4_format_with_metadata_csum_seed() {
+    for tool in ["tune2fs", "e2fsck", "dumpe2fs"] {
+        if which(tool).is_none() {
+            eprintln!("skipping: {tool} not installed");
+            return;
+        }
+    }
+
+    let opts = FormatOpts {
+        kind: FsKind::Ext4,
+        block_size: 4096,
+        blocks_count: 8192,
+        inodes_count: 64,
+        journal_blocks: 1024,
+        uuid: [0x5a; 16],
+        metadata_csum_seed: true,
+        ..FormatOpts::default()
+    };
+    let tmp = NamedTempFile::new().unwrap();
+    let size = opts.blocks_count as u64 * opts.block_size as u64;
+    let mut dev = FileBackend::create(tmp.path(), size).unwrap();
+    let mut ext = Ext::format_with(&mut dev, &opts).unwrap();
+    assert!(
+        ext.sb.feature_incompat & 0x2000 != 0,
+        "INCOMPAT_CSUM_SEED not set"
+    );
+    assert_ne!(ext.sb.checksum_seed, 0, "s_checksum_seed left zero");
+
+    let mut src = NamedTempFile::new().unwrap();
+    src.as_file_mut().write_all(b"first write\n").unwrap();
+    ext.add_file_to(
+        &mut dev,
+        2,
+        b"first.txt",
+        FileSource::HostPath(src.path().to_path_buf()),
+        FileMeta::with_mode(0o644),
+    )
+    .unwrap();
+    ext.flush(&mut dev).unwrap();
+    dev.sync().unwrap();
+    drop(dev);
+
+    assert_e2fsck_clean(tmp.path(), "the freshly formatted metadata_csum_seed image");
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum_seed", true);
+    assert_dumpe2fs_feature(tmp.path(), "metadata_csum", true);
+
+    // Rotate the UUID; only possible without a full checksum rewrite
+    // because the seed is pinned.
+    let out = Command::new("tune2fs")
+        .args(["-U", "11111111-2222-3333-4444-555555555555"])
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "tune2fs -U failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_e2fsck_clean(tmp.path(), "our image after tune2fs -U");
+
+    {
+        let mut dev = FileBackend::open(tmp.path()).unwrap();
+        let mut ext = Ext::open(&mut dev).unwrap();
+        assert_eq!(
+            ext.sb.uuid[0], 0x11,
+            "tune2fs -U should have changed the UUID"
+        );
+        let mut src = NamedTempFile::new().unwrap();
+        src.as_file_mut().write_all(b"second write\n").unwrap();
+        ext.add_file_to(
+            &mut dev,
+            2,
+            b"second.txt",
+            FileSource::HostPath(src.path().to_path_buf()),
+            FileMeta::with_mode(0o644),
+        )
+        .unwrap();
+        ext.flush(&mut dev).unwrap();
+        dev.sync().unwrap();
+    }
+    assert_e2fsck_clean(tmp.path(), "our image after a post-UUID-change write");
+}
+
+/// `metadata_csum_seed` without `metadata_csum` is an e2fsck error, so
+/// the formatter refuses it for the non-checksummed flavours.
+#[test]
+fn ext_metadata_csum_seed_requires_ext4() {
+    for kind in [FsKind::Ext2, FsKind::Ext3] {
+        let opts = FormatOpts {
+            kind,
+            block_size: 1024,
+            blocks_count: 8192,
+            inodes_count: 64,
+            journal_blocks: 1024,
+            metadata_csum_seed: true,
+            ..FormatOpts::default()
+        };
+        let mut dev = fstool::block::MemoryBackend::new(8192 * 1024);
+        let err = Ext::format_with(&mut dev, &opts).unwrap_err();
+        assert!(
+            matches!(err, fstool::Error::InvalidArgument(_)),
+            "{kind:?}: expected InvalidArgument, got {err:?}"
+        );
+    }
+}

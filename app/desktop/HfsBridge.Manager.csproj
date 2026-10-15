@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>HfsBridge.Manager</AssemblyName>
+    <NuGetAudit>false</NuGetAudit>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\simpleai-tools-transparent.png" LogicalName="HfsBridge.Manager.SimpleAiLogo" />
+    <EmbeddedResource Include="..\..\design\native-redesign\assets\*.png" LogicalName="HfsBridge.Manager.Art.%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

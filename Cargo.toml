@@ -1,0 +1,31 @@
+[package]
+name = "hfs-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Image-based development harness for persistent HFS+ access on Windows"
+
+[dependencies]
+fstool = { version = "=0.4.35", default-features = false, features = ["hfs-plus", "hfs", "hfs-compression"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+flate2 = "=1.1.5"
+
+[features]
+native-mount = ["dep:winfsp", "dep:windows", "dep:winfsp-sys"]
+# Only the disposable-VHD harness enables this. It cannot open existing VHDs.
+owned-vhd-test = []
+
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "=0.13.1", default-features = false, features = ["delayload"], optional = true }
+winfsp-sys = { version = "=0.12.1", optional = true }
+windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem"], optional = true }
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "=0.13.1", default-features = false, features = ["delayload"], optional = true }
+
+[patch.crates-io]
+fstool = { path = "vendor/fstool" }
+

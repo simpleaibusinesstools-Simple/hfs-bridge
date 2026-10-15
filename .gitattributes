@@ -1,0 +1,6 @@
+* text=auto
+*.png binary
+*.gz binary
+*.lzvn binary
+*.lzfse binary
+*.zbm binary
